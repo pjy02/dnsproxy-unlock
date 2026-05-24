@@ -1308,22 +1308,40 @@ select_gaidns_upstream() {
   return 0
 }
 
+post_rule_source_apply_prompt() {
+  local apply_now
+
+  echo
+  read -rp "是否立即一键应用（更新规则 + dnsproxy 接管系统 DNS）？[y/N]: " apply_now
+  apply_now="${apply_now:-N}"
+
+  if [[ "$apply_now" =~ ^[Yy]$ ]]; then
+    apply_rules_and_enable_system_dns
+  else
+    ok "规则分组配置已保存，可继续配置其他分组，稍后再一键应用。"
+    pause
+  fi
+}
+
 add_builtin_rule_source() {
   select_builtin_rule_groups || return 0
   ask_unlock_upstream
   upsert_selected_builtin_rule_groups "$ASKED_UPSTREAM" "手动解锁上游"
+  post_rule_source_apply_prompt
 }
 
 add_akile_rule_source() {
   select_builtin_rule_groups || return 0
   select_akile_upstream || return 1
   upsert_selected_builtin_rule_groups "$ASKED_UPSTREAM" "AKile DNS"
+  post_rule_source_apply_prompt
 }
 
 add_gaidns_rule_source() {
   select_builtin_rule_groups || return 0
   select_gaidns_upstream || return 1
   upsert_selected_builtin_rule_groups "$ASKED_UPSTREAM" "GaiDNS DoH"
+  post_rule_source_apply_prompt
 }
 
 add_custom_rule_source() {
@@ -1435,7 +1453,7 @@ manage_rule_sources_menu() {
     echo "3. 使用 GaiDNS DoH 添加内置分组"
     echo "4. 添加自定义分组（可自动推导 URL）"
     echo "5. 删除规则分组"
-    echo "6. 一键应用（更新规则 + 启动服务 + 应用系统DNS）"
+    echo "6. 一键应用（更新规则 + dnsproxy 接管系统 DNS）"
     echo "0. 返回主菜单"
     echo
 
@@ -1444,15 +1462,12 @@ manage_rule_sources_menu() {
     case "$choice" in
       1)
         add_builtin_rule_source
-        pause
         ;;
       2)
         add_akile_rule_source
-        pause
         ;;
       3)
         add_gaidns_rule_source
-        pause
         ;;
       4)
         add_custom_rule_source
@@ -1846,7 +1861,7 @@ apply_rules_and_enable_system_dns() {
   require_root
 
   echo
-  info "开始一键应用：更新规则 -> 启动/重启 dnsproxy -> 应用系统 DNS"
+  info "开始一键应用：更新规则 -> 启动/重启 dnsproxy -> dnsproxy 接管系统 DNS"
 
   if ! update_online_rules; then
     err "规则更新失败，已停止后续步骤。"
@@ -2317,6 +2332,18 @@ menu_blue_line() {
   printf '\033[%sG%b\n' "$MENU_RIGHT_COL" "${BLUE}│${NC}"
 }
 
+# 状态总览专用：把状态值固定到同一列，避免中文宽度差异导致“● 状态”不对齐。
+MENU_STATUS_VALUE_COL=31
+
+menu_blue_status_line() {
+  local label="${1:-}"
+  local value="${2:-}"
+
+  printf '  %b  %s' "${BLUE}│${NC}" "$label"
+  printf '\033[%sG%b' "$MENU_STATUS_VALUE_COL" "$value"
+  printf '\033[%sG%b\n' "$MENU_RIGHT_COL" "${BLUE}│${NC}"
+}
+
 # FIX: install_menu_command 移到循环外，只在启动时执行一次
 main_menu() {
   require_root
@@ -2363,10 +2390,10 @@ main_menu() {
     menu_cyan_fixed_right "╚══════════════════════════════════════════════════════" "╝"
     echo
     menu_blue_fixed_right "┌─ 状态总览 ───────────────────────────────────────────" "┐"
-    menu_blue_line 0 "  dnsproxy 安装状态：${install_icon}"
-    menu_blue_line 0 "  dnsproxy 运行状态：${run_icon}"
-    menu_blue_line 0 "  系统 DNS 接管状态：${dns_icon}"
-    menu_blue_line 0 "  规则自动更新状态：${timer_icon}"
+    menu_blue_status_line "dnsproxy 安装状态：" "$install_icon"
+    menu_blue_status_line "dnsproxy 运行状态：" "$run_icon"
+    menu_blue_status_line "系统 DNS 接管状态：" "$dns_icon"
+    menu_blue_status_line "规则自动更新状态：" "$timer_icon"
     menu_blue_fixed_right "└──────────────────────────────────────────────────────" "┘"
     echo
     menu_blue_fixed_right "┌──────────────────────────────────────────────────────" "┐"
@@ -2379,7 +2406,7 @@ main_menu() {
     menu_cyan_line 0 "  ${GREEN} 1)${NC} 安装 / 更新 dnsproxy"
     menu_cyan_line 0 "  ${GREEN} 2)${NC} 配置普通默认 DNS"
     menu_cyan_line 0 "  ${GREEN} 3)${NC} 在线规则分组管理"
-    menu_cyan_line 0 "  ${GREEN} 4)${NC} 一键应用（更新规则 + 启动服务 + 应用系统 DNS）"
+    menu_cyan_line 0 "  ${GREEN} 4)${NC} 一键应用（更新规则 + dnsproxy 接管系统 DNS）"
     menu_cyan_fixed_right "╠══ 服务控制 ══════════════════════════════════════════" "╣"
     menu_cyan_line 0 "  ${GREEN} 5)${NC} 启动 / 重启 dnsproxy"
     menu_cyan_line 0 "  ${GREEN} 6)${NC} 停止 dnsproxy"
