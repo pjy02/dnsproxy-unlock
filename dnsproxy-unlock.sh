@@ -42,15 +42,23 @@ YELLOW="\033[0;33m"
 BLUE="\033[0;34m"
 NC="\033[0m"
 
-# 这里只保存“在线规则 URL”，不保存本地域名规则。
-# 你可以后续自己在菜单里添加更多规则 URL。
+# 内置规则分组（可直接选择，无需手填 URL）
+# URL 统一按 blackmatrix7 规则仓库推导：
+# https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/refs/heads/master/rule/Clash/<Group>/<Group>.list
 BUILTIN_RULE_NAMES=(
   "YouTube"
+  "Netflix"
+  "Disney"
+  "TikTok"
+  "Telegram"
+  "OpenAI"
+  "Claude"
+  "Gemini"
+  "Spotify"
+  "Bahamut"
 )
 
-BUILTIN_RULE_URLS=(
-  "https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/refs/heads/master/rule/Clash/YouTube/YouTube.list"
-)
+BUILTIN_RULE_BASE_URL="https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/refs/heads/master/rule/Clash"
 
 # ============================================================
 # 基础输出
@@ -729,16 +737,23 @@ list_rule_sources() {
   echo "------------------------------------------------------------"
 }
 
+build_builtin_rule_url() {
+  local group="$1"
+  echo "${BUILTIN_RULE_BASE_URL}/${group}/${group}.list"
+}
+
 add_builtin_rule_source() {
-  local i
+  local i group url upstream
 
   echo
-  echo "可选内置在线规则链接："
+  echo "可选内置规则分组（自动推导 URL）："
   echo "------------------------------------------------------------"
 
   for i in "${!BUILTIN_RULE_NAMES[@]}"; do
-    echo "$((i + 1)). ${BUILTIN_RULE_NAMES[$i]}"
-    echo "   ${BUILTIN_RULE_URLS[$i]}"
+    group="${BUILTIN_RULE_NAMES[$i]}"
+    url="$(build_builtin_rule_url "$group")"
+    echo "$((i + 1)). $group"
+    echo "   $url"
   done
 
   echo "0. 返回"
@@ -756,16 +771,13 @@ add_builtin_rule_source() {
   fi
 
   local idx=$((choice - 1))
-
   if (( idx < 0 || idx >= ${#BUILTIN_RULE_NAMES[@]} )); then
     warn "无效选项"
     return 1
   fi
 
-  local group="${BUILTIN_RULE_NAMES[$idx]}"
-  local url="${BUILTIN_RULE_URLS[$idx]}"
-  local upstream
-
+  group="${BUILTIN_RULE_NAMES[$idx]}"
+  url="$(build_builtin_rule_url "$group")"
   upstream="$(ask_unlock_upstream)"
 
   upsert_rule_source "$group" "$url" "$upstream"
@@ -780,12 +792,8 @@ add_custom_rule_source() {
   echo " 添加自定义在线规则源"
   echo "============================================================"
   echo
-  echo "规则源应为 Clash .list 格式，例如："
-  echo "DOMAIN-SUFFIX,youtube.com"
-  echo "DOMAIN,example.com"
-  echo
-  echo "脚本只转换 DOMAIN / DOMAIN-SUFFIX。"
-  echo "IP-CIDR、DOMAIN-KEYWORD 等会被忽略。"
+  echo "你可以直接输入分组名自动推导 URL，例如：Netflix / YouTube / OpenAI"
+  echo "自动推导格式：${BUILTIN_RULE_BASE_URL}/<Group>/<Group>.list"
   echo
 
   read -rp "请输入分组名称，例如 Netflix / ChatGPT / YouTube: " group
@@ -797,13 +805,21 @@ add_custom_rule_source() {
     return 1
   fi
 
-  read -rp "请输入在线规则 URL: " url
-  url="$(trim "$url")"
+  read -rp "是否按分组名自动推导规则 URL？[Y/n]: " auto_url
+  auto_url="${auto_url:-Y}"
 
-  if [[ ! "$url" =~ ^https?:// ]]; then
-    err "规则 URL 必须以 http:// 或 https:// 开头"
-    pause
-    return 1
+  if [[ "$auto_url" =~ ^[Yy]$ ]]; then
+    url="$(build_builtin_rule_url "$group")"
+    info "已推导规则 URL：$url"
+  else
+    read -rp "请输入在线规则 URL: " url
+    url="$(trim "$url")"
+
+    if [[ ! "$url" =~ ^https?:// ]]; then
+      err "规则 URL 必须以 http:// 或 https:// 开头"
+      pause
+      return 1
+    fi
   fi
 
   upstream="$(ask_unlock_upstream)"
@@ -811,6 +827,7 @@ add_custom_rule_source() {
   upsert_rule_source "$group" "$url" "$upstream"
   ok "已添加 / 更新自定义规则源：$group"
 }
+
 
 upsert_rule_source() {
   local group="$1"
@@ -875,8 +892,8 @@ manage_rule_sources_menu() {
     echo
     list_rule_sources
     echo
-    echo "1. 添加内置在线规则链接"
-    echo "2. 添加自定义在线规则链接"
+    echo "1. 选择内置规则分组（自动 URL）"
+    echo "2. 添加自定义分组（可自动推导 URL）"
     echo "3. 删除规则分组"
     echo "4. 更新并转换在线规则"
     echo "0. 返回主菜单"
