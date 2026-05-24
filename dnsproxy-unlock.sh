@@ -62,6 +62,30 @@ BUILTIN_RULE_NAMES=(
 
 BUILTIN_RULE_BASE_URL="https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/refs/heads/master/rule/Clash"
 
+
+# AKile DNS 解锁上游候选。测速逻辑参考 AKDNS 脚本：使用 dig 对同一测试域名多次查询，取平均响应时间。
+AKILE_DNS_LIST=(
+  "66.66.66.66"
+  "45.207.157.146"
+  "108.160.138.51"
+  "139.180.133.239"
+  "45.76.83.113"
+  "45.76.71.83"
+  "45.63.99.176"
+  "166.0.199.207"
+)
+
+# GaiDNS DoH 解锁上游候选。
+GAIDNS_DOH_LIST=(
+  "https://hk.gaidns.top/doh"
+  "https://sg.gaidns.top/doh"
+  "https://us.gaidns.top/doh"
+)
+
+DNS_SPEED_TEST_DOMAIN="www.google.com"
+DNS_SPEED_TEST_COUNT="5"
+DNS_SPEED_TEST_TIMEOUT="1"
+
 # ============================================================
 # 基础输出
 # ============================================================
@@ -971,8 +995,11 @@ build_builtin_rule_url() {
   echo "${BUILTIN_RULE_BASE_URL}/${group}/${group}.list"
 }
 
-add_builtin_rule_source() {
-  local i selected upstream group url idx token
+SELECTED_RULE_GROUPS=()
+
+select_builtin_rule_groups() {
+  local i selected group idx token
+  SELECTED_RULE_GROUPS=()
 
   echo
   echo "可选内置规则分组："
@@ -988,7 +1015,7 @@ add_builtin_rule_source() {
   read -rp "请选择规则分组: " selected
   selected="$(trim "$selected")"
 
-  [[ -z "$selected" || "$selected" == "0" ]] && return 0
+  [[ -z "$selected" || "$selected" == "0" ]] && return 1
 
   if [[ "$selected" =~ ^[Vv]$ ]]; then
     read -rp "输入分组编号查看 URL: " token
@@ -1003,46 +1030,300 @@ add_builtin_rule_source() {
     else
       warn "编号无效"
     fi
-    return 0
+    return 1
   fi
-
-  ask_unlock_upstream
-  upstream="$ASKED_UPSTREAM"
 
   if [[ "$selected" =~ ^[Aa]$ ]]; then
     for i in "${!BUILTIN_RULE_NAMES[@]}"; do
-      group="${BUILTIN_RULE_NAMES[$i]}"
-      url="$(build_builtin_rule_url "$group")"
-      upsert_rule_source "$group" "$url" "$upstream"
+      SELECTED_RULE_GROUPS+=("${BUILTIN_RULE_NAMES[$i]}")
     done
-    ok "已批量添加全部内置分组"
     return 0
   fi
 
   selected="${selected//,/ }"
-  local added=0
+  local seen=" "
   for token in $selected; do
     if ! [[ "$token" =~ ^[0-9]+$ ]]; then
       warn "已跳过无效输入：$token"
       continue
     fi
+
     idx=$((token - 1))
     if (( idx < 0 || idx >= ${#BUILTIN_RULE_NAMES[@]} )); then
       warn "已跳过无效编号：$token"
       continue
     fi
+
     group="${BUILTIN_RULE_NAMES[$idx]}"
+    if [[ "$seen" == *" $group "* ]]; then
+      continue
+    fi
+    seen="${seen}${group} "
+    SELECTED_RULE_GROUPS+=("$group")
+  done
+
+  if (( ${#SELECTED_RULE_GROUPS[@]} == 0 )); then
+    warn "没有选择任何有效分组"
+    return 1
+  fi
+
+  return 0
+}
+
+upsert_selected_builtin_rule_groups() {
+  local upstream="$1"
+  local provider_name="${2:-解锁上游}"
+  local group url added=0
+
+  upstream="$(normalize_upstream "$upstream")"
+  if ! validate_upstream "$upstream"; then
+    err "上游地址非法：$upstream"
+    return 1
+  fi
+
+  for group in "${SELECTED_RULE_GROUPS[@]}"; do
     url="$(build_builtin_rule_url "$group")"
     upsert_rule_source "$group" "$url" "$upstream"
     added=$((added + 1))
   done
 
-  if (( added == 0 )); then
-    warn "没有成功添加任何分组"
+  ok "已使用 ${provider_name} 添加 / 更新 ${added} 个内置分组"
+  ok "解锁上游：$upstream"
+}
+
+run_ipv4_dns_latency_test() {
+  local domain="${DNS_SPEED_TEST_DOMAIN:-www.google.com}"
+  local count="${DNS_SPEED_TEST_COUNT:-5}"
+  local timeout="${DNS_SPEED_TEST_TIMEOUT:-1}"
+  local -a dns_list=("$@")
+  local tmpdir dns i t safe result_file result best_avg best_dns
+
+  if ! command -v dig >/dev/null 2>&1; then
+    warn "dig 未安装，正在尝试安装依赖。"
+    install_dependencies
+  fi
+
+  if ! command -v dig >/dev/null 2>&1; then
+    err "dig 仍然不可用，无法测速。"
     return 1
   fi
 
-  ok "已添加 / 更新 ${added} 个内置分组"
+  tmpdir="$(mktemp -d)"
+  result_file="${tmpdir}/result"
+
+  echo
+  echo "AKile DNS 延迟测试"
+  echo "测试域名：$domain"
+  echo "测试次数：${count} 次 / DNS，超时：${timeout}s"
+  echo "------------------------------------------------------------"
+  info "正在测速，请稍候..."
+
+  for dns in "${dns_list[@]}"; do
+    safe="${dns//./_}"
+    safe="${safe//:/_}"
+    for ((i = 1; i <= count; i++)); do
+      (
+        t="$(dig @"$dns" "$domain" +stats +time="$timeout" +tries=1 2>/dev/null | awk '/Query time/ {print $4; exit}')"
+        if [[ "$t" =~ ^[0-9]+$ ]]; then
+          echo "$dns $t"
+        else
+          echo "$dns 1000"
+        fi
+      ) > "${tmpdir}/result_${safe}_${i}" &
+    done
+  done
+
+  wait
+  cat "${tmpdir}"/result_* > "$result_file" 2>/dev/null || true
+
+  if [[ ! -s "$result_file" ]]; then
+    rm -rf "$tmpdir"
+    err "测速失败：未获取到任何结果"
+    return 1
+  fi
+
+  result="$(awk '
+    {
+      sum[$1] += $2
+      cnt[$1]++
+    }
+    END {
+      for (dns in sum) {
+        avg = sum[dns] / cnt[dns]
+        printf "%d %s\n", avg, dns
+      }
+    }
+  ' "$result_file" | sort -n)"
+
+  echo
+  echo "平均响应时间："
+  echo "------------------------------------------------------------"
+  echo "$result" | awk '{printf "  %s ms\t%s\n", $1, $2}'
+  echo "------------------------------------------------------------"
+
+  best_avg="$(echo "$result" | head -n 1 | awk '{print $1}')"
+  best_dns="$(echo "$result" | head -n 1 | awk '{print $2}')"
+
+  if [[ -z "$best_dns" || -z "$best_avg" || "$best_avg" -ge 1000 ]]; then
+    rm -rf "$tmpdir"
+    err "所有 AKile DNS 测速均超时，未能选出可用 DNS。"
+    return 1
+  fi
+
+  ASKED_UPSTREAM="$(normalize_upstream "$best_dns")"
+  ok "最低延迟 AKile DNS：${ASKED_UPSTREAM}（${best_avg}ms）"
+
+  echo
+  read -rp "确认使用最低延迟 AKile DNS？[Y/n]: " confirm
+  confirm="${confirm:-Y}"
+  if [[ "$confirm" =~ ^[Yy]$ ]]; then
+    rm -rf "$tmpdir"
+    return 0
+  fi
+
+  echo
+  echo "请选择要使用的 AKile DNS："
+  mapfile -t sorted_lines <<< "$result"
+  for i in "${!sorted_lines[@]}"; do
+    local avg dns_ip
+    avg="$(awk '{print $1}' <<< "${sorted_lines[$i]}")"
+    dns_ip="$(awk '{print $2}' <<< "${sorted_lines[$i]}")"
+    echo "$((i + 1)). ${dns_ip}:53 (${avg}ms)"
+  done
+  echo "0. 取消"
+  echo
+
+  read -rp "请输入选项: " choice
+  if [[ "$choice" == "0" || -z "$choice" ]]; then
+    rm -rf "$tmpdir"
+    warn "已取消 AKile DNS 配置"
+    return 1
+  fi
+
+  if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#sorted_lines[@]} )); then
+    rm -rf "$tmpdir"
+    err "无效选项"
+    return 1
+  fi
+
+  best_dns="$(awk '{print $2}' <<< "${sorted_lines[$((choice - 1))]}")"
+  ASKED_UPSTREAM="$(normalize_upstream "$best_dns")"
+  ok "已选择 AKile DNS：$ASKED_UPSTREAM"
+
+  rm -rf "$tmpdir"
+  return 0
+}
+
+select_akile_upstream() {
+  ASKED_UPSTREAM=""
+  run_ipv4_dns_latency_test "${AKILE_DNS_LIST[@]}"
+}
+
+run_https_latency_test() {
+  local -a urls=("$@")
+  local url t ms result best_ms best_url
+
+  if ! command -v curl >/dev/null 2>&1; then
+    warn "curl 未安装，正在尝试安装依赖。"
+    install_dependencies
+  fi
+
+  if ! command -v curl >/dev/null 2>&1; then
+    err "curl 仍然不可用，无法测速。"
+    return 1
+  fi
+
+  echo
+  echo "GaiDNS DoH 连接延迟测试"
+  echo "------------------------------------------------------------"
+
+  result=""
+  for url in "${urls[@]}"; do
+    t="$(curl -o /dev/null -s -L --connect-timeout 3 --max-time 5 -w '%{time_total}' "$url" 2>/dev/null || echo "5")"
+    ms="$(awk -v t="$t" 'BEGIN { printf "%d", t * 1000 }')"
+    [[ -n "$ms" ]] || ms="5000"
+    printf '  %s ms\t%s\n' "$ms" "$url"
+    result+="${ms} ${url}"$'\n'
+  done
+
+  best_ms="$(printf '%s' "$result" | sort -n | head -n 1 | awk '{print $1}')"
+  best_url="$(printf '%s' "$result" | sort -n | head -n 1 | cut -d' ' -f2-)"
+
+  if [[ -z "$best_url" || -z "$best_ms" || "$best_ms" -ge 5000 ]]; then
+    err "GaiDNS DoH 测速失败，未能选出可用上游。"
+    return 1
+  fi
+
+  ASKED_UPSTREAM="$best_url"
+  echo "------------------------------------------------------------"
+  ok "最低连接延迟 GaiDNS DoH：${ASKED_UPSTREAM}（${best_ms}ms）"
+}
+
+select_gaidns_upstream() {
+  local choice confirm
+  ASKED_UPSTREAM=""
+
+  echo
+  echo "请选择 GaiDNS DoH 上游："
+  echo "1. 香港：${GAIDNS_DOH_LIST[0]}"
+  echo "2. 新加坡：${GAIDNS_DOH_LIST[1]}"
+  echo "3. 美国：${GAIDNS_DOH_LIST[2]}"
+  echo "4. 自动测速选择最低连接延迟"
+  echo "0. 返回"
+  echo
+  read -rp "请输入选项: " choice
+
+  case "$choice" in
+    1)
+      ASKED_UPSTREAM="${GAIDNS_DOH_LIST[0]}"
+      ;;
+    2)
+      ASKED_UPSTREAM="${GAIDNS_DOH_LIST[1]}"
+      ;;
+    3)
+      ASKED_UPSTREAM="${GAIDNS_DOH_LIST[2]}"
+      ;;
+    4)
+      run_https_latency_test "${GAIDNS_DOH_LIST[@]}" || return 1
+      echo
+      read -rp "确认使用该 GaiDNS DoH？[Y/n]: " confirm
+      confirm="${confirm:-Y}"
+      [[ "$confirm" =~ ^[Yy]$ ]] || return 1
+      ;;
+    0|"")
+      return 1
+      ;;
+    *)
+      warn "无效选项"
+      return 1
+      ;;
+  esac
+
+  if ! validate_upstream "$ASKED_UPSTREAM"; then
+    err "GaiDNS 上游格式非法：$ASKED_UPSTREAM"
+    return 1
+  fi
+
+  ok "已选择 GaiDNS DoH：$ASKED_UPSTREAM"
+  return 0
+}
+
+add_builtin_rule_source() {
+  select_builtin_rule_groups || return 0
+  ask_unlock_upstream
+  upsert_selected_builtin_rule_groups "$ASKED_UPSTREAM" "手动解锁上游"
+}
+
+add_akile_rule_source() {
+  select_builtin_rule_groups || return 0
+  select_akile_upstream || return 1
+  upsert_selected_builtin_rule_groups "$ASKED_UPSTREAM" "AKile DNS"
+}
+
+add_gaidns_rule_source() {
+  select_builtin_rule_groups || return 0
+  select_gaidns_upstream || return 1
+  upsert_selected_builtin_rule_groups "$ASKED_UPSTREAM" "GaiDNS DoH"
 }
 
 add_custom_rule_source() {
@@ -1149,10 +1430,12 @@ manage_rule_sources_menu() {
     echo
     list_rule_sources
     echo
-    echo "1. 选择内置规则分组（自动 URL）"
-    echo "2. 添加自定义分组（可自动推导 URL）"
-    echo "3. 删除规则分组"
-    echo "4. 一键应用（更新规则 + 启动服务 + 应用系统DNS）"
+    echo "1. 选择内置规则分组（手动输入解锁上游）"
+    echo "2. 使用 AKile DNS 智能测速添加内置分组"
+    echo "3. 使用 GaiDNS DoH 添加内置分组"
+    echo "4. 添加自定义分组（可自动推导 URL）"
+    echo "5. 删除规则分组"
+    echo "6. 一键应用（更新规则 + 启动服务 + 应用系统DNS）"
     echo "0. 返回主菜单"
     echo
 
@@ -1164,13 +1447,21 @@ manage_rule_sources_menu() {
         pause
         ;;
       2)
-        add_custom_rule_source
+        add_akile_rule_source
+        pause
         ;;
       3)
-        remove_rule_source
+        add_gaidns_rule_source
         pause
         ;;
       4)
+        add_custom_rule_source
+        ;;
+      5)
+        remove_rule_source
+        pause
+        ;;
+      6)
         apply_rules_and_enable_system_dns
         ;;
       0)
