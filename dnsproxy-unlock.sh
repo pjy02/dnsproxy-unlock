@@ -330,6 +330,8 @@ validate_upstream() {
   return 1
 }
 
+ASKED_UPSTREAM=""
+
 ask_unlock_upstream() {
   local upstream confirm
 
@@ -370,7 +372,7 @@ ask_unlock_upstream() {
     confirm="${confirm:-Y}"
 
     if [[ "$confirm" =~ ^[Yy]$ ]]; then
-      echo "$upstream"
+      ASKED_UPSTREAM="$upstream"
       return 0
     fi
   done
@@ -776,7 +778,8 @@ add_builtin_rule_source() {
     return 0
   fi
 
-  upstream="$(ask_unlock_upstream)"
+  ask_unlock_upstream
+  upstream="$ASKED_UPSTREAM"
 
   if [[ "$selected" =~ ^[Aa]$ ]]; then
     for i in "${!BUILTIN_RULE_NAMES[@]}"; do
@@ -848,7 +851,8 @@ add_custom_rule_source() {
     fi
   fi
 
-  upstream="$(ask_unlock_upstream)"
+  ask_unlock_upstream
+  upstream="$ASKED_UPSTREAM"
   upsert_rule_source "$group" "$url" "$upstream"
   ok "已添加 / 更新自定义规则源：$group"
 }
