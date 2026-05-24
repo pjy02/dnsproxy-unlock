@@ -451,9 +451,13 @@ install_or_update_dnsproxy() {
 install_menu_command() {
   ensure_dir
 
-  local script_source
+  local script_source target_source
   script_source="$(readlink -f -- "${BASH_SOURCE[0]}")"
-  install -m 0755 "$script_source" "$MENU_SCRIPT_PATH"
+  target_source="$(readlink -f -- "$MENU_SCRIPT_PATH" 2>/dev/null || true)"
+
+  if [[ "$script_source" != "$target_source" ]]; then
+    install -m 0755 "$script_source" "$MENU_SCRIPT_PATH"
+  fi
 
   cat > "$DNS_CMD_PATH" << EOF
 #!/usr/bin/env bash
