@@ -1856,6 +1856,42 @@ uninstall_dnsproxy() {
 # 主菜单
 # ============================================================
 
+# 主菜单 UI 辅助函数
+# 说明：用 ANSI 光标定位把右边框固定在同一列，避免 ANSI 颜色码、中文宽字符或终端字体导致右侧边框不对齐。
+MENU_RIGHT_COL=58
+
+menu_cyan_fixed_right() {
+  local left_part="${1:-}"
+  local right_part="${2:-}"
+
+  printf '  %b%s' "${CYAN}" "$left_part"
+  printf '\033[%sG%s%b\n' "$MENU_RIGHT_COL" "$right_part" "${NC}"
+}
+
+menu_blue_fixed_right() {
+  local left_part="${1:-}"
+  local right_part="${2:-}"
+
+  printf '  %b%s' "${BLUE}" "$left_part"
+  printf '\033[%sG%s%b\n' "$MENU_RIGHT_COL" "$right_part" "${NC}"
+}
+
+menu_cyan_line() {
+  local _visible_len="${1:-0}"  # 兼容旧调用参数，不再使用
+  local content="${2:-}"
+
+  printf '  %b%b' "${CYAN}║${NC}" "$content"
+  printf '\033[%sG%b\n' "$MENU_RIGHT_COL" "${CYAN}║${NC}"
+}
+
+menu_blue_line() {
+  local _visible_len="${1:-0}"  # 兼容旧调用参数，不再使用
+  local content="${2:-}"
+
+  printf '  %b%b' "${BLUE}│${NC}" "$content"
+  printf '\033[%sG%b\n' "$MENU_RIGHT_COL" "${BLUE}│${NC}"
+}
+
 # FIX: install_menu_command 移到循环外，只在启动时执行一次
 main_menu() {
   require_root
@@ -1886,47 +1922,45 @@ main_menu() {
     fi
 
     clear
-    echo -e "${CYAN}"
-    echo "  ╔══════════════════════════════════════════════════════"
-    echo "  ║"
-    echo "  ║    ┌─ AdGuard dnsproxy ── DNS 分流解锁管理 ─┐"
-    echo "  ║    └────────────────────────────────────────┘"
-    echo "  ║"
-    echo "  ╚══════════════════════════════════════════════════════"
-    echo -e "${NC}"
+    menu_cyan_fixed_right "╔══════════════════════════════════════════════════════" "╗"
+    menu_cyan_line 0 ""
+    menu_cyan_line 0 "    ┌─ AdGuard dnsproxy ── DNS 分流解锁管理 ─┐"
+    menu_cyan_line 0 "    └────────────────────────────────────────┘"
+    menu_cyan_line 0 ""
+    menu_cyan_fixed_right "╚══════════════════════════════════════════════════════" "╝"
     echo -e "  安装  ${install_icon}   运行  ${run_icon}   系统DNS  ${dns_icon}"
     echo
-    echo -e "  ${BLUE}┌──────────────────────────────────────────────────────${NC}"
-    echo -e "  ${BLUE}│${NC}  ${CYAN}◈ 推荐 DNS 解锁服务${NC}"
-    echo -e "  ${BLUE}│${NC}    ${YELLOW}▸${NC} AKile DNS   ${GREEN}https://dns.akile.ai/${NC}"
-    echo -e "  ${BLUE}│${NC}    ${YELLOW}▸${NC} GaiDNS      ${GREEN}https://gaidns.com/${NC}"
-    echo -e "  ${BLUE}│${NC}  ${CYAN}◈ 说明${NC}"
-    echo -e "  ${BLUE}│${NC}    ${YELLOW}▸${NC} 本脚本不内置解锁 DNS，需自行从服务商获取"
-    echo -e "  ${BLUE}│${NC}    ${YELLOW}▸${NC} 普通公共 DNS（如 1.1.1.1）不是解锁 DNS"
-    echo -e "  ${BLUE}└──────────────────────────────────────────────────────${NC}"
+    menu_blue_fixed_right "┌──────────────────────────────────────────────────────" "┐"
+    menu_blue_line 0 "  ${CYAN}◈ 推荐 DNS 解锁服务${NC}"
+    menu_blue_line 0 "    ${YELLOW}▸${NC} AKile DNS   ${GREEN}https://dns.akile.ai/${NC}"
+    menu_blue_line 0 "    ${YELLOW}▸${NC} GaiDNS      ${GREEN}https://gaidns.com/${NC}"
+    menu_blue_line 0 "  ${CYAN}◈ 说明${NC}"
+    menu_blue_line 0 "    ${YELLOW}▸${NC} 本脚本不内置解锁 DNS，需自行从服务商获取"
+    menu_blue_line 0 "    ${YELLOW}▸${NC} 普通公共 DNS（如 1.1.1.1）不是解锁 DNS"
+    menu_blue_fixed_right "└──────────────────────────────────────────────────────" "┘"
     echo
-    echo -e "  ${CYAN}╔══ 安装与配置 ═══════════════════════════════════════"
-    echo -e "  ${CYAN}║${NC}  ${GREEN} 1)${NC} 安装 / 更新 dnsproxy"
-    echo -e "  ${CYAN}║${NC}  ${GREEN} 2)${NC} 配置普通默认 DNS"
-    echo -e "  ${CYAN}║${NC}  ${GREEN} 3)${NC} 在线规则分组管理"
-    echo -e "  ${CYAN}║${NC}  ${GREEN} 4)${NC} 一键应用（更新规则 + 启动服务 + 应用系统 DNS）"
-    echo -e "  ${CYAN}╠══ 服务控制 ═══════════════════════════════════════════"
-    echo -e "  ${CYAN}║${NC}  ${GREEN} 5)${NC} 启动 / 重启 dnsproxy"
-    echo -e "  ${CYAN}║${NC}  ${GREEN} 6)${NC} 停止 dnsproxy"
-    echo -e "  ${CYAN}║${NC}  ${GREEN} 7)${NC} 恢复系统 DNS 备份"
-    echo -e "  ${CYAN}╠══ 查看与调试 ═══════════════════════════════════════════"
-    echo -e "  ${CYAN}║${NC}  ${GREEN} 8)${NC} 测试域名解析"
-    echo -e "  ${CYAN}║${NC}  ${GREEN} 9)${NC} 查看状态"
-    echo -e "  ${CYAN}║${NC}  ${GREEN}10)${NC} 查看日志"
-    echo -e "  ${CYAN}║${NC}  ${GREEN}11)${NC} 预览生成的 upstream 规则"
-    echo -e "  ${CYAN}║${NC}  ${GREEN}12)${NC} 查看被忽略的规则"
-    echo -e "  ${CYAN}╠══ 高级功能 ═══════════════════════════════════════════"
-    echo -e "  ${CYAN}║${NC}  ${GREEN}13)${NC} 启用规则自动更新（systemd timer）"
-    echo -e "  ${CYAN}║${NC}  ${GREEN}14)${NC} 禁用规则自动更新"
-    echo -e "  ${CYAN}║${NC}  ${RED}15)${NC} 卸载 dnsproxy"
-    echo -e "  ${CYAN}╠══════════════════════════════════════════════════════"
-    echo -e "  ${CYAN}║${NC}  ${YELLOW} 0)${NC} 退出"
-    echo -e "  ${CYAN}╚══════════════════════════════════════════════════════"
+    menu_cyan_fixed_right "╔══ 安装与配置 ════════════════════════════════════════" "╗"
+    menu_cyan_line 0 "  ${GREEN} 1)${NC} 安装 / 更新 dnsproxy"
+    menu_cyan_line 0 "  ${GREEN} 2)${NC} 配置普通默认 DNS"
+    menu_cyan_line 0 "  ${GREEN} 3)${NC} 在线规则分组管理"
+    menu_cyan_line 0 "  ${GREEN} 4)${NC} 一键应用（更新规则 + 启动服务 + 应用系统 DNS）"
+    menu_cyan_fixed_right "╠══ 服务控制 ══════════════════════════════════════════" "╣"
+    menu_cyan_line 0 "  ${GREEN} 5)${NC} 启动 / 重启 dnsproxy"
+    menu_cyan_line 0 "  ${GREEN} 6)${NC} 停止 dnsproxy"
+    menu_cyan_line 0 "  ${GREEN} 7)${NC} 恢复系统 DNS 备份"
+    menu_cyan_fixed_right "╠══ 查看与调试 ════════════════════════════════════════" "╣"
+    menu_cyan_line 0 "  ${GREEN} 8)${NC} 测试域名解析"
+    menu_cyan_line 0 "  ${GREEN} 9)${NC} 查看状态"
+    menu_cyan_line 0 "  ${GREEN}10)${NC} 查看日志"
+    menu_cyan_line 0 "  ${GREEN}11)${NC} 预览生成的 upstream 规则"
+    menu_cyan_line 0 "  ${GREEN}12)${NC} 查看被忽略的规则"
+    menu_cyan_fixed_right "╠══ 高级功能 ══════════════════════════════════════════" "╣"
+    menu_cyan_line 0 "  ${GREEN}13)${NC} 启用规则自动更新（systemd timer）"
+    menu_cyan_line 0 "  ${GREEN}14)${NC} 禁用规则自动更新"
+    menu_cyan_line 0 "  ${RED}15)${NC} 卸载 dnsproxy"
+    menu_cyan_fixed_right "╠══════════════════════════════════════════════════════" "╣"
+    menu_cyan_line 0 "  ${YELLOW} 0)${NC} 退出"
+    menu_cyan_fixed_right "╚══════════════════════════════════════════════════════" "╝"
     echo
 
     read -rp "  请输入选项: " choice
