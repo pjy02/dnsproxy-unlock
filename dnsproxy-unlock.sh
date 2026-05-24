@@ -619,20 +619,80 @@ verify_dnsproxy_running() {
 # 53 端口冲突处理
 # ============================================================
 
-show_port_53_usage() {
+# 获取所有 53 端口监听行。
+# 使用 ss -H 去掉表头，避免 grep 到标题行。
+get_port_53_usage() {
   if command -v ss >/dev/null 2>&1; then
-    ss -lntup 2>/dev/null | grep -E '(:53\s|:53$)' || true
+    ss -H -lntup 2>/dev/null | awk '$5 ~ /:53$/ { print }' || true
   else
+    return 1
+  fi
+}
+
+show_port_53_usage() {
+  if ! command -v ss >/dev/null 2>&1; then
     warn "系统没有 ss 命令，无法检测 53 端口。"
+    return 0
+  fi
+
+  local usage
+  usage="$(get_port_53_usage || true)"
+
+  if [[ -n "$usage" ]]; then
+    printf '%s\n' "$usage"
+  else
+    echo "未发现 53 端口监听。"
   fi
 }
 
 is_port_53_used() {
-  if command -v ss >/dev/null 2>&1; then
-    ss -lntup 2>/dev/null | grep -qE '(:53\s|:53$)'
-  else
-    return 1
+  local usage
+  usage="$(get_port_53_usage || true)"
+  [[ -n "$usage" ]]
+}
+
+# 判断 53 端口是否真的与当前 dnsproxy 监听地址冲突。
+# 重点修复：如果 53 端口是 dnsproxy 自己占用，不算冲突。
+# 同时避免把 127.0.0.53:53 这类不影响 127.0.0.1:53 的监听误判为冲突。
+get_port_53_conflict_usage() {
+  local listen_addr="${1:-127.0.0.1}"
+
+  if ! command -v ss >/dev/null 2>&1; then
+    return 0
   fi
+
+  get_port_53_usage | awk -v la="$listen_addr" '
+    {
+      local_addr = $5
+      conflict = 0
+
+      # 如果 dnsproxy 配置为通配监听，则任何 53 端口监听都可能冲突。
+      if (la == "0.0.0.0" || la == "::" || la == "[::]" || la == "*") {
+        conflict = 1
+      }
+
+      # 精确匹配当前监听地址。
+      if (local_addr == la ":53" || local_addr == "[" la "]:53") {
+        conflict = 1
+      }
+
+      # 通配监听会占住端口，通常会影响 127.0.0.1:53。
+      if (local_addr == "0.0.0.0:53" || local_addr == "*:53" || local_addr == "[::]:53" || local_addr == ":::53") {
+        conflict = 1
+      }
+
+      if (conflict) {
+        print
+      }
+    }
+  ' | grep -v 'users:(("dnsproxy"' || true
+}
+
+is_port_53_conflicted() {
+  local listen_addr="${1:-127.0.0.1}"
+  local conflicts
+  conflicts="$(get_port_53_conflict_usage "$listen_addr" || true)"
+  [[ -n "$conflicts" ]]
 }
 
 handle_port_conflict() {
@@ -642,12 +702,32 @@ handle_port_conflict() {
     return 0
   fi
 
-  if ! is_port_53_used; then
+  local listen_addr all_usage conflict_usage
+  listen_addr="${LISTEN_ADDR:-127.0.0.1}"
+  all_usage="$(get_port_53_usage || true)"
+
+  # 没有任何 53 端口监听，不冲突。
+  if [[ -z "$all_usage" ]]; then
+    return 0
+  fi
+
+  conflict_usage="$(get_port_53_conflict_usage "$listen_addr" || true)"
+
+  # 只有 dnsproxy 自己占用，或者其他地址占用但不影响当前监听地址，不弹冲突菜单。
+  if [[ -z "$conflict_usage" ]]; then
+    if printf '%s\n' "$all_usage" | grep -q 'users:(("dnsproxy"'; then
+      info "53 端口当前由 dnsproxy 使用，属于正常状态，跳过冲突处理。"
+    else
+      info "53 端口已有监听，但不影响当前监听地址 ${listen_addr}:53，跳过冲突处理。"
+    fi
     return 0
   fi
 
   echo
-  warn "检测到 53 端口可能已被占用："
+  warn "检测到 ${listen_addr}:53 可能被非 dnsproxy 进程占用："
+  printf '%s\n' "$conflict_usage"
+  echo
+  echo "全部 53 端口监听情况："
   show_port_53_usage
   echo
   echo "如果 53 端口被 systemd-resolved、dnsmasq、named 等占用，dnsproxy 可能启动失败。"
@@ -686,6 +766,7 @@ handle_port_conflict() {
       ;;
   esac
 }
+
 
 # ============================================================
 # 普通默认 DNS 配置
