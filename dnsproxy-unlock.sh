@@ -1523,6 +1523,9 @@ main_menu() {
   require_root
   create_default_config_if_missing
 
+  # 确保首次运行脚本后即可直接使用 `dns` 命令再次打开菜单
+  install_menu_command
+
   while true; do
     clear
     echo "============================================================"
