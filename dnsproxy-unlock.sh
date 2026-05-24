@@ -2,15 +2,12 @@
 
 # ============================================================
 # AdGuard dnsproxy 在线规则 DNS 分流解锁脚本
-# GitHub: https://github.com/pjy02/dnsproxy-unlock.
-#
 # 功能：
 # - 安装 / 更新 AdGuard dnsproxy
 # - 在线拉取 Clash .list 规则
 # - 转换 DOMAIN / DOMAIN-SUFFIX 为 dnsproxy upstream 格式
 # - 不内置默认解锁 DNS / DoH
 # - 用户自行输入解锁 DNS / DoH / DoT / DoQ / IPv4 DNS
-# - 主菜单支持输入 dns / doh / unlock 快捷打开解锁 DNS 配置
 # - 支持 systemd 服务
 # - 支持 systemd timer 自动更新规则
 # - 支持测试解析、状态查看、卸载恢复
@@ -18,11 +15,10 @@
 
 set -Eeuo pipefail
 
+APP_NAME="dnsproxy-unlock"
 APP_DIR="/opt/dnsproxy"
 BIN_PATH="${APP_DIR}/dnsproxy"
 RUNNER_PATH="${APP_DIR}/run-dnsproxy.sh"
-SCRIPT_COPY="${APP_DIR}/dnsproxy-unlock.sh"
-
 CONFIG_FILE="${APP_DIR}/config.env"
 SOURCE_FILE="${APP_DIR}/rule-sources.conf"
 UPSTREAM_FILE="${APP_DIR}/upstream.txt"
@@ -44,6 +40,8 @@ YELLOW="\033[0;33m"
 BLUE="\033[0;34m"
 NC="\033[0m"
 
+# 这里只保存“在线规则 URL”，不保存本地域名规则。
+# 你可以后续自己在菜单里添加更多规则 URL。
 BUILTIN_RULE_NAMES=(
   "YouTube"
 )
@@ -53,7 +51,7 @@ BUILTIN_RULE_URLS=(
 )
 
 # ============================================================
-# 基础函数
+# 基础输出
 # ============================================================
 
 info() {
@@ -101,16 +99,8 @@ ensure_dir() {
   mkdir -p "$APP_DIR"
 }
 
-install_self_copy() {
-  ensure_dir
-
-  if [[ -f "${0}" ]]; then
-    install -m 0755 "$0" "$SCRIPT_COPY" 2>/dev/null || true
-  fi
-}
-
 # ============================================================
-# 系统依赖
+# 系统检测和依赖安装
 # ============================================================
 
 detect_pkg_manager() {
@@ -191,9 +181,8 @@ detect_arch() {
 # 配置文件
 # ============================================================
 
-create_default_files() {
+create_default_config_if_missing() {
   ensure_dir
-  install_self_copy
 
   if [[ ! -f "$CONFIG_FILE" ]]; then
     cat > "$CONFIG_FILE" << 'EOF'
@@ -232,16 +221,15 @@ EOF
 # dnsproxy upstream rules
 # 当前还没有规则。
 # 请运行脚本菜单：
-# 3. 在线规则分组管理
-# 或者在主菜单直接输入：
-# dns
+# 3. 添加在线规则分组
+# 4. 更新并转换在线规则
 EOF
     ok "已创建空规则文件：$UPSTREAM_FILE"
   fi
 }
 
 load_config() {
-  create_default_files
+  create_default_config_if_missing
   # shellcheck disable=SC1090
   source "$CONFIG_FILE"
 }
@@ -250,7 +238,7 @@ save_config_value() {
   local key="$1"
   local value="$2"
 
-  create_default_files
+  create_default_config_if_missing
 
   if grep -q "^${key}=" "$CONFIG_FILE"; then
     sed -i "s|^${key}=.*|${key}=\"${value}\"|" "$CONFIG_FILE"
@@ -260,8 +248,21 @@ save_config_value() {
 }
 
 # ============================================================
-# DNS 上游规范化
+# upstream 规范化与校验
 # ============================================================
+
+normalize_upstream() {
+  local upstream
+  upstream="$(trim "$1")"
+
+  # 纯 IPv4 自动补 :53
+  if [[ "$upstream" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+    echo "${upstream}:53"
+    return 0
+  fi
+
+  echo "$upstream"
+}
 
 is_valid_ipv4() {
   local ip="$1"
@@ -280,24 +281,13 @@ is_valid_ipv4() {
   return 0
 }
 
-normalize_upstream() {
-  local upstream
-  upstream="$(trim "$1")"
-
-  if [[ "$upstream" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
-    echo "${upstream}:53"
-    return 0
-  fi
-
-  echo "$upstream"
-}
-
 validate_upstream() {
   local upstream
   upstream="$(trim "$1")"
 
   [[ -n "$upstream" ]] || return 1
 
+  # DoH / DoT / DoQ / DNSCrypt / TCP / UDP / HTTP3
   if [[ "$upstream" =~ ^https:// ]]; then return 0; fi
   if [[ "$upstream" =~ ^http:// ]]; then return 0; fi
   if [[ "$upstream" =~ ^tls:// ]]; then return 0; fi
@@ -307,11 +297,13 @@ validate_upstream() {
   if [[ "$upstream" =~ ^udp:// ]]; then return 0; fi
   if [[ "$upstream" =~ ^h3:// ]]; then return 0; fi
 
+  # IPv4
   if [[ "$upstream" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
     is_valid_ipv4 "$upstream"
     return $?
   fi
 
+  # IPv4:port
   if [[ "$upstream" =~ ^(([0-9]{1,3}\.){3}[0-9]{1,3}):([0-9]{1,5})$ ]]; then
     local ip="${BASH_REMATCH[1]}"
     local port="${BASH_REMATCH[4]}"
@@ -320,6 +312,7 @@ validate_upstream() {
     return 0
   fi
 
+  # 域名:端口 或 域名
   if [[ "$upstream" =~ ^[A-Za-z0-9.-]+(:[0-9]{1,5})?$ ]]; then
     return 0
   fi
@@ -374,7 +367,7 @@ ask_unlock_upstream() {
 }
 
 # ============================================================
-# dnsproxy 安装
+# 安装 dnsproxy
 # ============================================================
 
 get_latest_dnsproxy_url() {
@@ -396,6 +389,59 @@ get_latest_dnsproxy_url() {
   fi
 
   echo "https://github.com/AdguardTeam/dnsproxy/releases/download/${DNSPROXY_FALLBACK_VERSION}/dnsproxy-linux-${arch}-${DNSPROXY_FALLBACK_VERSION}.tar.gz"
+}
+
+install_or_update_dnsproxy() {
+  require_root
+  ensure_dir
+  install_dependencies
+
+  local arch url tmp tgz extracted_bin
+  arch="$(detect_arch)"
+  url="$(get_latest_dnsproxy_url "$arch")"
+  tmp="$(mktemp -d)"
+  tgz="${tmp}/dnsproxy.tar.gz"
+
+  info "系统架构：linux-${arch}"
+  info "下载 dnsproxy：$url"
+
+  if ! curl -fL --retry 3 --connect-timeout 15 -o "$tgz" "$url"; then
+    err "dnsproxy 下载失败"
+    rm -rf "$tmp"
+    exit 1
+  fi
+
+  tar xzf "$tgz" -C "$tmp"
+
+  extracted_bin="$(find "$tmp" -type f -name dnsproxy | head -n 1 || true)"
+
+  if [[ -z "$extracted_bin" ]]; then
+    err "未找到 dnsproxy 可执行文件"
+    rm -rf "$tmp"
+    exit 1
+  fi
+
+  install -m 0755 "$extracted_bin" "$BIN_PATH"
+  rm -rf "$tmp"
+
+  create_default_config_if_missing
+  create_runner
+  create_systemd_service
+
+  ok "dnsproxy 安装 / 更新完成"
+  "$BIN_PATH" --version || true
+
+  echo
+  read -rp "是否立即启动 dnsproxy？[Y/n]: " start_now
+  start_now="${start_now:-Y}"
+
+  if [[ "$start_now" =~ ^[Yy]$ ]]; then
+    handle_port_conflict
+    systemctl daemon-reload
+    systemctl enable dnsproxy
+    systemctl restart dnsproxy
+    ok "dnsproxy 已启动"
+  fi
 }
 
 create_runner() {
@@ -468,61 +514,8 @@ EOF
   ok "已创建 systemd 服务：$SERVICE_FILE"
 }
 
-install_or_update_dnsproxy() {
-  require_root
-  ensure_dir
-  install_dependencies
-  create_default_files
-
-  local arch url tmp tgz extracted_bin
-  arch="$(detect_arch)"
-  url="$(get_latest_dnsproxy_url "$arch")"
-  tmp="$(mktemp -d)"
-  tgz="${tmp}/dnsproxy.tar.gz"
-
-  info "系统架构：linux-${arch}"
-  info "下载 dnsproxy：$url"
-
-  if ! curl -fL --retry 3 --connect-timeout 15 -o "$tgz" "$url"; then
-    err "dnsproxy 下载失败"
-    rm -rf "$tmp"
-    return 1
-  fi
-
-  tar xzf "$tgz" -C "$tmp"
-
-  extracted_bin="$(find "$tmp" -type f -name dnsproxy | head -n 1 || true)"
-
-  if [[ -z "$extracted_bin" ]]; then
-    err "未找到 dnsproxy 可执行文件"
-    rm -rf "$tmp"
-    return 1
-  fi
-
-  install -m 0755 "$extracted_bin" "$BIN_PATH"
-  rm -rf "$tmp"
-
-  create_runner
-  create_systemd_service
-
-  ok "dnsproxy 安装 / 更新完成"
-  "$BIN_PATH" --version || true
-
-  echo
-  read -rp "是否立即启动 dnsproxy？[Y/n]: " start_now
-  start_now="${start_now:-Y}"
-
-  if [[ "$start_now" =~ ^[Yy]$ ]]; then
-    handle_port_conflict || true
-    systemctl daemon-reload
-    systemctl enable dnsproxy
-    systemctl restart dnsproxy
-    ok "dnsproxy 已启动"
-  fi
-}
-
 # ============================================================
-# 端口检测
+# 53 端口冲突处理
 # ============================================================
 
 show_port_53_usage() {
@@ -555,6 +548,8 @@ handle_port_conflict() {
   echo
   warn "检测到 53 端口可能已被占用："
   show_port_53_usage
+  echo
+  echo "如果 53 端口被 systemd-resolved、dnsmasq、named 等占用，dnsproxy 可能启动失败。"
   echo
   echo "请选择："
   echo "1. 继续，不处理"
@@ -592,7 +587,7 @@ handle_port_conflict() {
 }
 
 # ============================================================
-# 普通默认 DNS
+# 普通默认 DNS 配置
 # ============================================================
 
 configure_default_dns() {
@@ -604,7 +599,8 @@ configure_default_dns() {
   echo " 配置普通默认 DNS"
   echo "============================================================"
   echo
-  echo "说明：这里不是解锁 DNS。"
+  echo "说明："
+  echo "这里不是解锁 DNS。"
   echo "没有命中分流规则的普通域名，会走这里配置的 DNS。"
   echo
   echo "当前默认 DNS：${DEFAULT_UPSTREAMS:-未配置}"
@@ -676,11 +672,11 @@ configure_default_dns() {
 }
 
 # ============================================================
-# 在线规则管理
+# 在线规则源管理
 # ============================================================
 
 list_rule_sources() {
-  create_default_files
+  create_default_config_if_missing
 
   echo
   echo "当前在线规则源："
@@ -709,33 +705,8 @@ list_rule_sources() {
   echo "------------------------------------------------------------"
 }
 
-upsert_rule_source() {
-  local group="$1"
-  local url="$2"
-  local upstream="$3"
-
-  create_default_files
-
-  local tmp
-  tmp="$(mktemp)"
-
-  awk -F'|' -v g="$group" '
-    BEGIN { OFS="|" }
-    /^[[:space:]]*#/ { print; next }
-    /^[[:space:]]*$/ { print; next }
-    {
-      name=$1
-      gsub(/^[[:space:]]+|[[:space:]]+$/, "", name)
-      if (name != g) print
-    }
-  ' "$SOURCE_FILE" > "$tmp"
-
-  echo "${group}|${url}|${upstream}" >> "$tmp"
-  mv "$tmp" "$SOURCE_FILE"
-}
-
 add_builtin_rule_source() {
-  local i choice idx group url upstream
+  local i
 
   echo
   echo "可选内置在线规则链接："
@@ -760,15 +731,17 @@ add_builtin_rule_source() {
     return 1
   fi
 
-  idx=$((choice - 1))
+  local idx=$((choice - 1))
 
   if (( idx < 0 || idx >= ${#BUILTIN_RULE_NAMES[@]} )); then
     warn "无效选项"
     return 1
   fi
 
-  group="${BUILTIN_RULE_NAMES[$idx]}"
-  url="${BUILTIN_RULE_URLS[$idx]}"
+  local group="${BUILTIN_RULE_NAMES[$idx]}"
+  local url="${BUILTIN_RULE_URLS[$idx]}"
+  local upstream
+
   upstream="$(ask_unlock_upstream)"
 
   upsert_rule_source "$group" "$url" "$upstream"
@@ -815,8 +788,34 @@ add_custom_rule_source() {
   ok "已添加 / 更新自定义规则源：$group"
 }
 
+upsert_rule_source() {
+  local group="$1"
+  local url="$2"
+  local upstream="$3"
+
+  create_default_config_if_missing
+
+  local tmp
+  tmp="$(mktemp)"
+
+  # 删除同名分组
+  awk -F'|' -v g="$group" '
+    BEGIN { OFS="|" }
+    /^[[:space:]]*#/ { print; next }
+    /^[[:space:]]*$/ { print; next }
+    {
+      name=$1
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", name)
+      if (name != g) print
+    }
+  ' "$SOURCE_FILE" > "$tmp"
+
+  echo "${group}|${url}|${upstream}" >> "$tmp"
+  mv "$tmp" "$SOURCE_FILE"
+}
+
 remove_rule_source() {
-  create_default_files
+  create_default_config_if_missing
   list_rule_sources
 
   echo
@@ -843,148 +842,6 @@ remove_rule_source() {
   ok "已删除分组：$group"
 }
 
-update_all_rule_sources_upstream() {
-  create_default_files
-
-  local upstream tmp count
-  upstream="$(ask_unlock_upstream)"
-  tmp="$(mktemp)"
-  count=0
-
-  awk -F'|' -v u="$upstream" '
-    BEGIN { OFS="|" }
-    /^[[:space:]]*#/ { print; next }
-    /^[[:space:]]*$/ { print; next }
-    {
-      print $1, $2, u
-    }
-  ' "$SOURCE_FILE" > "$tmp"
-
-  count="$(awk -F'|' '
-    /^[[:space:]]*#/ { next }
-    /^[[:space:]]*$/ { next }
-    { n++ }
-    END { print n+0 }
-  ' "$SOURCE_FILE")"
-
-  mv "$tmp" "$SOURCE_FILE"
-
-  ok "已将全部规则分组的解锁上游修改为：$upstream"
-  ok "影响分组数量：$count"
-}
-
-update_one_rule_source_upstream() {
-  create_default_files
-  list_rule_sources
-
-  local group upstream tmp exists
-  echo
-  read -rp "请输入要修改的分组名称: " group
-  group="$(trim "$group")"
-
-  if [[ -z "$group" ]]; then
-    warn "分组名不能为空"
-    return 1
-  fi
-
-  exists="$(awk -F'|' -v g="$group" '
-    /^[[:space:]]*#/ { next }
-    /^[[:space:]]*$/ { next }
-    {
-      name=$1
-      gsub(/^[[:space:]]+|[[:space:]]+$/, "", name)
-      if (name == g) found=1
-    }
-    END { print found+0 }
-  ' "$SOURCE_FILE")"
-
-  if [[ "$exists" != "1" ]]; then
-    warn "没有找到分组：$group"
-    return 1
-  fi
-
-  upstream="$(ask_unlock_upstream)"
-  tmp="$(mktemp)"
-
-  awk -F'|' -v g="$group" -v u="$upstream" '
-    BEGIN { OFS="|" }
-    /^[[:space:]]*#/ { print; next }
-    /^[[:space:]]*$/ { print; next }
-    {
-      name=$1
-      gsub(/^[[:space:]]+|[[:space:]]+$/, "", name)
-      if (name == g) {
-        print $1, $2, u
-      } else {
-        print
-      }
-    }
-  ' "$SOURCE_FILE" > "$tmp"
-
-  mv "$tmp" "$SOURCE_FILE"
-
-  ok "已修改分组 ${group} 的解锁上游为：$upstream"
-}
-
-unlock_dns_menu() {
-  while true; do
-    clear
-    echo "============================================================"
-    echo " 配置解锁 DNS / DoH 上游"
-    echo "============================================================"
-    echo
-    echo "你可以在主菜单直接输入 dns / doh / unlock 打开这里。"
-    echo
-    echo "推荐获取 DNS 解锁服务："
-    echo "1. https://dns.akile.ai/"
-    echo "2. https://gaidns.com/"
-    echo
-    echo "当前规则源："
-    list_rule_sources
-    echo
-    echo "菜单："
-    echo "1. 修改全部已有规则分组的解锁 DNS / DoH"
-    echo "2. 修改指定规则分组的解锁 DNS / DoH"
-    echo "3. 添加内置规则分组并输入解锁 DNS / DoH"
-    echo "4. 添加自定义规则链接并输入解锁 DNS / DoH"
-    echo "5. 更新并转换在线规则"
-    echo "0. 返回主菜单"
-    echo
-
-    read -rp "请输入选项: " choice
-
-    case "$(lower "$(trim "$choice")")" in
-      1)
-        update_all_rule_sources_upstream
-        pause
-        ;;
-      2)
-        update_one_rule_source_upstream
-        pause
-        ;;
-      3)
-        add_builtin_rule_source
-        pause
-        ;;
-      4)
-        add_custom_rule_source
-        pause
-        ;;
-      5)
-        update_online_rules
-        pause
-        ;;
-      0|q|quit|exit)
-        return 0
-        ;;
-      *)
-        warn "无效选项"
-        pause
-        ;;
-    esac
-  done
-}
-
 manage_rule_sources_menu() {
   while true; do
     clear
@@ -997,44 +854,30 @@ manage_rule_sources_menu() {
     echo "1. 添加内置在线规则链接"
     echo "2. 添加自定义在线规则链接"
     echo "3. 删除规则分组"
-    echo "4. 修改全部规则分组的解锁 DNS / DoH"
-    echo "5. 修改指定规则分组的解锁 DNS / DoH"
-    echo "6. 更新并转换在线规则"
+    echo "4. 更新并转换在线规则"
     echo "0. 返回主菜单"
     echo
 
     read -rp "请输入选项: " choice
 
-    case "$(lower "$(trim "$choice")")" in
+    case "$choice" in
       1)
         add_builtin_rule_source
         pause
         ;;
       2)
         add_custom_rule_source
-        pause
         ;;
       3)
         remove_rule_source
         pause
         ;;
       4)
-        update_all_rule_sources_upstream
-        pause
-        ;;
-      5)
-        update_one_rule_source_upstream
-        pause
-        ;;
-      6)
         update_online_rules
         pause
         ;;
-      0|q|quit|exit)
+      0)
         return 0
-        ;;
-      dns|doh|unlock)
-        unlock_dns_menu
         ;;
       *)
         warn "无效选项"
@@ -1055,14 +898,22 @@ is_valid_domain() {
 
   [[ -n "$domain" ]] || return 1
 
+  # 去除常见前缀
   domain="${domain#+.}"
   domain="${domain#*.}"
 
   [[ -n "$domain" ]] || return 1
+
+  # 不允许明显非法字符
   [[ "$domain" =~ ^[a-z0-9._-]+$ ]] || return 1
+
+  # 不允许以点或横线开头/结尾
   [[ ! "$domain" =~ ^[.-] ]] || return 1
   [[ ! "$domain" =~ [.-]$ ]] || return 1
 
+  # 至少包含一个点，或者是像 youtube 这种特殊 TLD/内部规则。
+  # dnsproxy 本身可以接受 [/youtube/]，但通常不建议。
+  # 这里不强制必须有点，避免 youtube 这类规则被误删。
   return 0
 }
 
@@ -1071,11 +922,13 @@ clean_domain_value() {
   domain="$(trim "$1")"
   domain="$(lower "$domain")"
 
+  # 去掉 Clash rule-provider yaml 的引号
   domain="${domain%\"}"
   domain="${domain#\"}"
   domain="${domain%\'}"
   domain="${domain#\'}"
 
+  # 去掉通配和 +. 前缀
   domain="${domain#+.}"
   domain="${domain#*.}"
 
@@ -1090,13 +943,19 @@ convert_rule_line() {
   line="${line//$'\r'/}"
   line="$(trim "$line")"
 
+  # 兼容 YAML rule-provider:
+  # - DOMAIN-SUFFIX,example.com
   line="$(echo "$line" | sed 's/^[[:space:]]*-[[:space:]]*//')"
   line="$(trim "$line")"
 
   [[ -z "$line" ]] && return 0
+
+  # 跳过注释
   [[ "$line" =~ ^# ]] && return 0
   [[ "$line" =~ ^// ]] && return 0
   [[ "$line" =~ ^\; ]] && return 0
+
+  # 跳过 yaml 结构
   [[ "$line" == "payload:" ]] && return 0
   [[ "$line" =~ ^payload: ]] && return 0
 
@@ -1109,6 +968,7 @@ convert_rule_line() {
   type="${line%%,*}"
   value="${line#*,}"
 
+  # 删除第三字段，例如 no-resolve
   value="${value%%,*}"
 
   type="$(upper "$(trim "$type")")"
@@ -1128,6 +988,9 @@ convert_rule_line() {
       ;;
 
     DOMAIN-WILDCARD)
+      # dnsproxy 没有 Clash 这种通配表达方式。
+      # 简单的 *.example.com 已经在 clean_domain_value 里能变成 example.com。
+      # 但复杂 wildcard 容易误伤，所以默认忽略。
       echo "[$group] ignored DOMAIN-WILDCARD: $line" >> "$IGNORED_LOG"
       ;;
 
@@ -1189,7 +1052,7 @@ download_and_convert_group() {
 update_online_rules() {
   require_root
   ensure_dir
-  create_default_files
+  create_default_config_if_missing
 
   : > "$TMP_FILE"
   : > "$IGNORED_LOG"
@@ -1226,7 +1089,7 @@ update_online_rules() {
   if [[ "$total_count" -eq 0 ]]; then
     rm -f "$TMP_FILE"
     warn "没有配置任何在线规则源。"
-    echo "你可以在主菜单输入 dns，然后添加规则分组。"
+    echo "请先添加规则源。"
     return 1
   fi
 
@@ -1236,6 +1099,7 @@ update_online_rules() {
     return 1
   fi
 
+  # 规则去重
   local dedup_file
   dedup_file="$(mktemp)"
 
@@ -1265,20 +1129,12 @@ update_online_rules() {
 }
 
 # ============================================================
-# 自动更新
+# 自动更新 timer
 # ============================================================
 
 install_update_timer() {
   require_root
   ensure_dir
-  install_self_copy
-
-  if [[ ! -x "$SCRIPT_COPY" ]]; then
-    err "没有找到脚本副本：$SCRIPT_COPY"
-    err "请先运行：1. 安装 / 更新 dnsproxy"
-    pause
-    return 1
-  fi
 
   cat > "$UPDATE_SERVICE_FILE" << EOF
 [Unit]
@@ -1286,12 +1142,12 @@ Description=Update dnsproxy online rules
 
 [Service]
 Type=oneshot
-ExecStart=${SCRIPT_COPY} --update-rules
+ExecStart=${APP_DIR}/update-rules.sh
 EOF
 
   cat > "${APP_DIR}/update-rules.sh" << EOF
 #!/usr/bin/env bash
-exec ${SCRIPT_COPY} --update-rules
+exec "$0" --update-rules
 EOF
 
   chmod +x "${APP_DIR}/update-rules.sh"
@@ -1330,7 +1186,7 @@ disable_update_timer() {
 }
 
 # ============================================================
-# 系统 DNS
+# 系统 DNS 设置
 # ============================================================
 
 apply_system_dns() {
@@ -1347,6 +1203,10 @@ apply_system_dns() {
   echo
   echo "当前 dnsproxy 监听：${LISTEN_ADDR}:${LISTEN_PORT}"
   echo
+
+  if [[ "${LISTEN_ADDR}" != "127.0.0.1" ]]; then
+    warn "当前监听地址不是 127.0.0.1，请确认你知道自己在做什么。"
+  fi
 
   if [[ "${LISTEN_PORT}" != "53" ]]; then
     warn "当前监听端口不是 53。"
@@ -1427,14 +1287,14 @@ EOF
 }
 
 # ============================================================
-# 状态、日志、测试
+# 状态和测试
 # ============================================================
 
 show_status() {
   echo
-  echo "============================================================"
+  echo "================================================------------"
   echo " dnsproxy 状态"
-  echo "============================================================"
+  echo "================================================------------"
   echo
 
   if [[ -x "$BIN_PATH" ]]; then
@@ -1448,6 +1308,7 @@ show_status() {
   [[ -f "$CONFIG_FILE" ]] && cat "$CONFIG_FILE" || true
 
   echo
+  echo "规则源：$SOURCE_FILE"
   list_rule_sources
 
   echo
@@ -1567,6 +1428,13 @@ stop_dnsproxy() {
   pause
 }
 
+restart_dnsproxy() {
+  require_root
+  systemctl restart dnsproxy
+  ok "dnsproxy 已重启"
+  pause
+}
+
 # ============================================================
 # 卸载
 # ============================================================
@@ -1628,7 +1496,7 @@ uninstall_dnsproxy() {
 
 main_menu() {
   require_root
-  create_default_files
+  create_default_config_if_missing
 
   while true; do
     clear
@@ -1645,9 +1513,6 @@ main_menu() {
     echo "- 解锁上游需要你自己从服务商获取并输入。"
     echo "- 普通 IPv4 DNS 例如 1.1.1.1 支持作为 dnsproxy 上游。"
     echo "- 但 1.1.1.1 是普通公共 DNS，不是解锁 DNS。"
-    echo
-    echo "快捷命令："
-    echo "- 输入 dns / doh / unlock 可直接配置解锁 DNS / DoH。"
     echo
     echo "菜单："
     echo "1. 安装 / 更新 dnsproxy"
@@ -1670,12 +1535,8 @@ main_menu() {
     echo
 
     read -rp "请输入选项: " choice
-    choice="$(lower "$(trim "$choice")")"
 
     case "$choice" in
-      dns|doh|unlock)
-        unlock_dns_menu
-        ;;
       1)
         install_or_update_dnsproxy
         pause
@@ -1727,7 +1588,7 @@ main_menu() {
       16)
         uninstall_dnsproxy
         ;;
-      0|q|quit|exit)
+      0)
         exit 0
         ;;
       *)
