@@ -924,7 +924,7 @@ manage_rule_sources_menu() {
     echo "1. 选择内置规则分组（自动 URL）"
     echo "2. 添加自定义分组（可自动推导 URL）"
     echo "3. 删除规则分组"
-    echo "4. 更新并转换在线规则"
+    echo "4. 一键应用（更新规则 + 启动服务 + 应用系统DNS）"
     echo "0. 返回主菜单"
     echo
 
@@ -943,8 +943,7 @@ manage_rule_sources_menu() {
         pause
         ;;
       4)
-        update_online_rules
-        pause
+        apply_rules_and_enable_system_dns
         ;;
       0)
         return 0
@@ -1262,6 +1261,62 @@ disable_update_timer() {
 # ============================================================
 # 系统 DNS 设置
 # ============================================================
+
+
+apply_rules_and_enable_system_dns() {
+  require_root
+
+  echo
+  info "开始一键应用：更新规则 -> 启动/重启 dnsproxy -> 应用系统 DNS"
+
+  if ! update_online_rules; then
+    err "规则更新失败，已停止后续步骤。"
+    pause
+    return 1
+  fi
+
+  handle_port_conflict || true
+  systemctl daemon-reload
+  systemctl enable dnsproxy
+  systemctl restart dnsproxy
+  ok "dnsproxy 已启动 / 重启"
+
+  if apply_system_dns_auto; then
+    ok "已完成一键应用"
+  else
+    warn "已更新规则并启动 dnsproxy，但系统 DNS 应用失败。"
+  fi
+
+  pause
+}
+
+apply_system_dns_auto() {
+  require_root
+  load_config
+
+  if [[ "${LISTEN_PORT}" != "53" ]]; then
+    warn "当前监听端口不是 53，跳过系统 DNS 自动应用。"
+    return 1
+  fi
+
+  if command -v chattr >/dev/null 2>&1; then
+    chattr -i "$RESOLV_CONF" 2>/dev/null || true
+  fi
+
+  if [[ ! -f "$RESOLV_BACKUP" && -e "$RESOLV_CONF" ]]; then
+    cp -aL "$RESOLV_CONF" "$RESOLV_BACKUP" || true
+    ok "已备份：$RESOLV_BACKUP"
+  fi
+
+  rm -f "$RESOLV_CONF"
+  cat > "$RESOLV_CONF" << EOF
+nameserver ${LISTEN_ADDR}
+options edns0 trust-ad
+EOF
+
+  ok "已应用系统 DNS 到 ${LISTEN_ADDR}"
+  return 0
+}
 
 apply_system_dns() {
   require_root
@@ -1596,19 +1651,18 @@ main_menu() {
     echo "1. 安装 / 更新 dnsproxy"
     echo "2. 配置普通默认 DNS"
     echo "3. 在线规则分组管理"
-    echo "4. 更新并转换在线规则"
+    echo "4. 一键应用（更新规则 + 启动服务 + 应用系统DNS）"
     echo "5. 启动 / 重启 dnsproxy"
     echo "6. 停止 dnsproxy"
-    echo "7. 应用系统 DNS 到 127.0.0.1"
-    echo "8. 恢复系统 DNS 备份"
-    echo "9. 测试域名解析"
-    echo "10. 查看状态"
-    echo "11. 查看日志"
-    echo "12. 预览生成的 upstream 规则"
-    echo "13. 查看被忽略的规则"
-    echo "14. 启用规则自动更新"
-    echo "15. 禁用规则自动更新"
-    echo "16. 卸载 dnsproxy"
+    echo "7. 恢复系统 DNS 备份"
+    echo "8. 测试域名解析"
+    echo "9. 查看状态"
+    echo "10. 查看日志"
+    echo "11. 预览生成的 upstream 规则"
+    echo "12. 查看被忽略的规则"
+    echo "13. 启用规则自动更新"
+    echo "14. 禁用规则自动更新"
+    echo "15. 卸载 dnsproxy"
     echo "0. 退出"
     echo
 
@@ -1626,8 +1680,7 @@ main_menu() {
         manage_rule_sources_menu
         ;;
       4)
-        update_online_rules
-        pause
+        apply_rules_and_enable_system_dns
         ;;
       5)
         start_dnsproxy
@@ -1636,34 +1689,31 @@ main_menu() {
         stop_dnsproxy
         ;;
       7)
-        apply_system_dns
-        ;;
-      8)
         restore_system_dns
         ;;
-      9)
+      8)
         test_dns
         ;;
-      10)
+      9)
         show_status
         ;;
-      11)
+      10)
         show_logs
         pause
         ;;
-      12)
+      11)
         preview_upstream_rules
         ;;
-      13)
+      12)
         preview_ignored_rules
         ;;
-      14)
+      13)
         install_update_timer
         ;;
-      15)
+      14)
         disable_update_timer
         ;;
-      16)
+      15)
         uninstall_dnsproxy
         ;;
       0)
