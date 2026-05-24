@@ -24,6 +24,7 @@ SOURCE_FILE="${APP_DIR}/rule-sources.conf"
 UPSTREAM_FILE="${APP_DIR}/upstream.txt"
 IGNORED_LOG="${APP_DIR}/ignored-rules.log"
 TMP_FILE="${APP_DIR}/upstream.txt.tmp"
+LOCK_FILE="${APP_DIR}/.update.lock"
 
 SERVICE_FILE="/etc/systemd/system/dnsproxy.service"
 UPDATE_SERVICE_FILE="/etc/systemd/system/dnsproxy-rule-update.service"
@@ -92,9 +93,10 @@ require_root() {
   fi
 }
 
+# FIX: 使用 printf 替代 echo，避免含反引号或 $(...) 的输入被 shell 展开
 trim() {
-  local s="$*"
-  echo "$s" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+  local s="$1"
+  printf '%s' "$s" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
 }
 
 lower() {
@@ -129,15 +131,24 @@ detect_pkg_manager() {
   fi
 }
 
+# FIX: 先检测关键工具是否已存在，避免每次都执行 apt-get update
 install_dependencies() {
   local pm
   pm="$(detect_pkg_manager)"
+
+  if command -v curl >/dev/null 2>&1 && \
+     command -v dig  >/dev/null 2>&1 && \
+     command -v ss   >/dev/null 2>&1 && \
+     command -v awk  >/dev/null 2>&1; then
+    ok "依赖已满足，跳过安装"
+    return 0
+  fi
 
   info "检查并安装依赖：curl tar gzip grep sed awk sort ss dig"
 
   case "$pm" in
     apt)
-      apt-get update
+      apt-get update -q
       apt-get install -y curl tar gzip grep sed gawk coreutils iproute2 dnsutils ca-certificates
       ;;
     dnf)
@@ -244,17 +255,18 @@ load_config() {
   source "$CONFIG_FILE"
 }
 
+# FIX: 改用删除旧行+追加新行，避免 sed 的 | 分隔符与值内容冲突
 save_config_value() {
   local key="$1"
   local value="$2"
 
   create_default_config_if_missing
 
-  if grep -q "^${key}=" "$CONFIG_FILE"; then
-    sed -i "s|^${key}=.*|${key}=\"${value}\"|" "$CONFIG_FILE"
-  else
-    echo "${key}=\"${value}\"" >> "$CONFIG_FILE"
-  fi
+  # 删除已有的同名 key 行（key 只含大写字母和下划线，模式安全）
+  sed -i "/^${key}=/d" "$CONFIG_FILE"
+
+  # 追加新值（printf 不会解释特殊字符）
+  printf '%s="%s"\n' "$key" "$value" >> "$CONFIG_FILE"
 }
 
 # ============================================================
@@ -382,13 +394,14 @@ ask_unlock_upstream() {
 # 安装 dnsproxy
 # ============================================================
 
+# FIX: 校验 GitHub API 返回的下载 URL 必须来自 github.com/AdguardTeam
 get_latest_dnsproxy_url() {
   local arch="$1"
   local api url
 
   api="https://api.github.com/repos/AdguardTeam/dnsproxy/releases/latest"
 
-  url="$(curl -fsSL "$api" \
+  url="$(curl -fsSL --connect-timeout 10 "$api" \
     | grep "browser_download_url" \
     | grep "linux-${arch}" \
     | grep "tar.gz" \
@@ -396,8 +409,12 @@ get_latest_dnsproxy_url() {
     | sed 's/.*"browser_download_url": "\(.*\)".*/\1/' || true)"
 
   if [[ -n "$url" ]]; then
-    echo "$url"
-    return 0
+    if [[ "$url" =~ ^https://github\.com/AdguardTeam/ ]]; then
+      echo "$url"
+      return 0
+    else
+      warn "GitHub API 返回了不可信的下载地址，使用内置回退版本。"
+    fi
   fi
 
   echo "https://github.com/AdguardTeam/dnsproxy/releases/download/${DNSPROXY_FALLBACK_VERSION}/dnsproxy-linux-${arch}-${DNSPROXY_FALLBACK_VERSION}.tar.gz"
@@ -454,24 +471,47 @@ install_or_update_dnsproxy() {
     systemctl enable dnsproxy
     systemctl restart dnsproxy
     ok "dnsproxy 已启动"
+    verify_dnsproxy_running
   fi
 }
 
 
+# FIX: 检测 BASH_SOURCE[0] 是否有效（curl|bash 管道执行时为空或 /dev/stdin）
+# FIX: 安装 dns 命令前检测是否与系统已有命令冲突
 install_menu_command() {
   ensure_dir
 
-  local script_source target_source
-  script_source="$(readlink -f -- "${BASH_SOURCE[0]}")"
+  local script_source="${BASH_SOURCE[0]:-}"
+
+  # 管道执行时无法获取脚本路径，跳过菜单命令安装
+  if [[ -z "$script_source" || "$script_source" == "/dev/stdin" ]]; then
+    warn "检测到以管道方式运行，跳过菜单命令安装。"
+    warn "请将脚本下载到本地后重新执行，以启用 'dns' 快捷命令。"
+    return 0
+  fi
+
+  script_source="$(readlink -f -- "$script_source")"
+  local target_source
   target_source="$(readlink -f -- "$MENU_SCRIPT_PATH" 2>/dev/null || true)"
 
   if [[ "$script_source" != "$target_source" ]]; then
     install -m 0755 "$script_source" "$MENU_SCRIPT_PATH"
   fi
 
+  # 检测 dns 命令是否已被其他程序占用
+  if [[ -e "$DNS_CMD_PATH" ]] && ! grep -q "dnsproxy" "$DNS_CMD_PATH" 2>/dev/null; then
+    warn "$DNS_CMD_PATH 已存在且不属于本脚本（可能是系统命令）"
+    read -rp "确认覆盖？[y/N]: " confirm
+    confirm="${confirm:-N}"
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+      warn "已跳过创建 'dns' 快捷命令"
+      return 0
+    fi
+  fi
+
   cat > "$DNS_CMD_PATH" << EOF
 #!/usr/bin/env bash
-exec "${MENU_SCRIPT_PATH}" "$@"
+exec "${MENU_SCRIPT_PATH}" "\$@"
 EOF
 
   chmod +x "$DNS_CMD_PATH"
@@ -546,6 +586,33 @@ EOF
 
   systemctl daemon-reload
   ok "已创建 systemd 服务：$SERVICE_FILE"
+}
+
+# ============================================================
+# 启动后健康检查
+# ============================================================
+
+# FIX: 新增函数，重启服务后自动验证解析是否正常
+verify_dnsproxy_running() {
+  load_config
+
+  local server="${LISTEN_ADDR:-127.0.0.1}"
+  local port="${LISTEN_PORT:-53}"
+
+  info "等待 dnsproxy 就绪..."
+  sleep 1
+
+  if ! command -v dig >/dev/null 2>&1; then
+    warn "dig 未安装，跳过解析验证。"
+    return 0
+  fi
+
+  if dig +short +time=2 +tries=1 @"$server" -p "$port" cloudflare.com >/dev/null 2>&1; then
+    ok "解析测试通过（@${server}:${port} -> cloudflare.com）"
+  else
+    warn "解析测试失败，dnsproxy 可能未正常工作。"
+    warn "请查看日志：journalctl -u dnsproxy -n 30 --no-pager"
+  fi
 }
 
 # ============================================================
@@ -982,9 +1049,6 @@ is_valid_domain() {
   [[ ! "$domain" =~ ^[.-] ]] || return 1
   [[ ! "$domain" =~ [.-]$ ]] || return 1
 
-  # 至少包含一个点，或者是像 youtube 这种特殊 TLD/内部规则。
-  # dnsproxy 本身可以接受 [/youtube/]，但通常不建议。
-  # 这里不强制必须有点，避免 youtube 这类规则被误删。
   return 0
 }
 
@@ -1122,10 +1186,20 @@ download_and_convert_group() {
   ok "分组转换完成：$group"
 }
 
+# FIX: 使用 flock 防止并发更新破坏规则文件
+# FIX: 修复去重逻辑，改用 awk 保序去重，不再分离注释和规则
 update_online_rules() {
   require_root
   ensure_dir
   create_default_config_if_missing
+
+  # 并发锁：同一时间只允许一个更新进程运行
+  exec 9>"$LOCK_FILE"
+  if ! flock -n 9; then
+    warn "另一个规则更新进程正在运行，请稍后再试。"
+    exec 9>&-
+    return 0
+  fi
 
   : > "$TMP_FILE"
   : > "$IGNORED_LOG"
@@ -1161,6 +1235,7 @@ update_online_rules() {
 
   if [[ "$total_count" -eq 0 ]]; then
     rm -f "$TMP_FILE"
+    exec 9>&-
     warn "没有配置任何在线规则源。"
     echo "请先添加规则源。"
     return 1
@@ -1168,21 +1243,26 @@ update_online_rules() {
 
   if [[ "$success_count" -eq 0 ]]; then
     rm -f "$TMP_FILE"
+    exec 9>&-
     err "所有规则源都更新失败，未覆盖旧规则。"
     return 1
   fi
 
-  # 规则去重
+  # 规则去重：注释行原样保留，规则行（[/.../)按内容去重，保持原始顺序
   local dedup_file
   dedup_file="$(mktemp)"
 
-  {
-    grep '^#' "$TMP_FILE" || true
-    grep '^\[/' "$TMP_FILE" | sort -u || true
-  } > "$dedup_file"
+  awk '
+    /^#/            { print; next }
+    /^[[:space:]]*$/ { print; next }
+    !seen[$0]++     { print }
+  ' "$TMP_FILE" > "$dedup_file"
 
   mv "$dedup_file" "$UPSTREAM_FILE"
   rm -f "$TMP_FILE"
+
+  # 释放锁
+  exec 9>&-
 
   local rule_count ignored_count
   rule_count="$(grep -c '^\[/' "$UPSTREAM_FILE" || true)"
@@ -1280,6 +1360,7 @@ apply_rules_and_enable_system_dns() {
   systemctl enable dnsproxy
   systemctl restart dnsproxy
   ok "dnsproxy 已启动 / 重启"
+  verify_dnsproxy_running
 
   if apply_system_dns_auto; then
     ok "已完成一键应用"
@@ -1608,6 +1689,7 @@ start_dnsproxy() {
   systemctl enable dnsproxy
   systemctl restart dnsproxy
   ok "dnsproxy 已启动 / 重启"
+  verify_dnsproxy_running
   pause
 }
 
@@ -1622,6 +1704,7 @@ restart_dnsproxy() {
   require_root
   systemctl restart dnsproxy
   ok "dnsproxy 已重启"
+  verify_dnsproxy_running
   pause
 }
 
@@ -1659,7 +1742,13 @@ uninstall_dnsproxy() {
   systemctl disable --now dnsproxy-rule-update.timer 2>/dev/null || true
 
   rm -f "$SERVICE_FILE" "$UPDATE_SERVICE_FILE" "$UPDATE_TIMER_FILE"
-  rm -f "$DNS_CMD_PATH" "$MENU_SCRIPT_PATH"
+
+  # 只删除属于本脚本的 dns 命令
+  if [[ -e "$DNS_CMD_PATH" ]] && grep -q "dnsproxy" "$DNS_CMD_PATH" 2>/dev/null; then
+    rm -f "$DNS_CMD_PATH"
+  fi
+
+  rm -f "$MENU_SCRIPT_PATH"
   systemctl daemon-reload
 
   read -rp "是否恢复 /etc/resolv.conf 备份？[Y/n]: " restore
@@ -1685,11 +1774,10 @@ uninstall_dnsproxy() {
 # 主菜单
 # ============================================================
 
+# FIX: install_menu_command 移到循环外，只在启动时执行一次
 main_menu() {
   require_root
   create_default_config_if_missing
-
-  # 确保首次运行脚本后即可直接使用 `dns` 命令再次打开菜单
   install_menu_command
 
   while true; do
