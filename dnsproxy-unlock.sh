@@ -1419,11 +1419,45 @@ EOF
 # 状态和测试
 # ============================================================
 
+get_dnsproxy_install_status() {
+  if [[ -x "$BIN_PATH" ]]; then
+    echo "已安装"
+  else
+    echo "未安装"
+  fi
+}
+
+get_dnsproxy_run_status() {
+  if systemctl is-active --quiet dnsproxy; then
+    echo "运行中"
+  else
+    echo "未运行"
+  fi
+}
+
+get_system_dns_status() {
+  if [[ -f "$RESOLV_CONF" ]]; then
+    local ns
+    ns="$(awk '/^nameserver[[:space:]]+/ {print $2; exit}' "$RESOLV_CONF" 2>/dev/null || true)"
+    if [[ -n "$ns" ]]; then
+      echo "$ns"
+    else
+      echo "未知"
+    fi
+  else
+    echo "不存在"
+  fi
+}
+
 show_status() {
   echo
   echo "================================================------------"
   echo " dnsproxy 状态"
   echo "================================================------------"
+  echo "实时状态总览："
+  echo "- dnsproxy 安装状态：$(get_dnsproxy_install_status)"
+  echo "- dnsproxy 运行状态：$(get_dnsproxy_run_status)"
+  echo "- 当前系统 DNS：$(get_system_dns_status)"
   echo
 
   if [[ -x "$BIN_PATH" ]]; then
@@ -1646,6 +1680,8 @@ main_menu() {
     echo "- 解锁上游需要你自己从服务商获取并输入。"
     echo "- 普通 IPv4 DNS 例如 1.1.1.1 支持作为 dnsproxy 上游。"
     echo "- 但 1.1.1.1 是普通公共 DNS，不是解锁 DNS。"
+    echo
+    echo "当前状态：安装=$(get_dnsproxy_install_status) / 运行=$(get_dnsproxy_run_status) / 系统DNS=$(get_system_dns_status)"
     echo
     echo "菜单："
     echo "1. 安装 / 更新 dnsproxy"
