@@ -69,13 +69,13 @@ udp://1.2.3.4
 推荐使用下面命令下载脚本并运行：
 
 ```bash
-curl -fsSL -o dnsproxy-unlock.sh https://raw.githubusercontent.com/pjy02/dnsproxy-unlock./refs/heads/main/dnsproxy-unlock.sh && chmod +x dnsproxy-unlock.sh && sudo ./dnsproxy-unlock.sh
+curl -fsSL -o dnsproxy-unlock.sh https://raw.githubusercontent.com/pjy02/dnsproxy-unlock/refs/heads/main/dnsproxy-unlock.sh && chmod +x dnsproxy-unlock.sh && sudo ./dnsproxy-unlock.sh
 ```
 
 或者使用 `wget`：
 
 ```bash
-wget -O dnsproxy-unlock.sh https://raw.githubusercontent.com/pjy02/dnsproxy-unlock./refs/heads/main/dnsproxy-unlock.sh && chmod +x dnsproxy-unlock.sh && sudo ./dnsproxy-unlock.sh
+wget -O dnsproxy-unlock.sh https://raw.githubusercontent.com/pjy02/dnsproxy-unlock/refs/heads/main/dnsproxy-unlock.sh && chmod +x dnsproxy-unlock.sh && sudo ./dnsproxy-unlock.sh
 ```
 
 ---
@@ -87,40 +87,39 @@ wget -O dnsproxy-unlock.sh https://raw.githubusercontent.com/pjy02/dnsproxy-unlo
 ```txt
 1. 安装 / 更新 dnsproxy
 3. 在线规则分组管理
-   -> 添加内置在线规则链接
+   -> 选择内置规则分组（可多选）
    -> 选择 YouTube
    -> 输入你的解锁 DNS / DoH
-4. 更新并转换在线规则
-5. 启动 / 重启 dnsproxy
-9. 测试域名解析
-7. 应用系统 DNS 到 127.0.0.1
+4. 一键应用（更新规则+启动服务+应用系统DNS）
+8. 测试域名解析
 ```
 
 ---
 
 ## 快速说明
 
-运行脚本后会看到菜单：
+运行脚本后会看到菜单，主页会实时显示当前状态（安装 / 运行 / DNS模式）：
 
 ```txt
 AdGuard dnsproxy 在线规则 DNS 分流解锁脚本
 
+当前状态：安装=已安装 / 运行=运行中 / DNS模式=外部DNS(1.1.1.1)
+
 1. 安装 / 更新 dnsproxy
 2. 配置普通默认 DNS
 3. 在线规则分组管理
-4. 更新并转换在线规则
+4. 一键应用（更新规则+启动服务+应用系统DNS）
 5. 启动 / 重启 dnsproxy
 6. 停止 dnsproxy
-7. 应用系统 DNS 到 127.0.0.1
-8. 恢复系统 DNS 备份
-9. 测试域名解析
-10. 查看状态
-11. 查看日志
-12. 预览生成的 upstream 规则
-13. 查看被忽略的规则
-14. 启用规则自动更新
-15. 禁用规则自动更新
-16. 卸载 dnsproxy
+7. 恢复系统 DNS 备份
+8. 测试域名解析
+9. 查看状态
+10. 查看日志
+11. 预览生成的 upstream 规则
+12. 查看被忽略的规则
+13. 启用规则自动更新
+14. 禁用规则自动更新
+15. 卸载 dnsproxy
 0. 退出
 ```
 
@@ -137,22 +136,35 @@ AdGuard dnsproxy 在线规则 DNS 分流解锁脚本
 可以选择：
 
 ```txt
-1. 添加内置在线规则链接
-2. 添加自定义在线规则链接
+1. 选择内置规则分组（支持多选/全选）
+2. 添加自定义分组（可自动推导 URL）
 3. 删除规则分组
-4. 更新并转换在线规则
+4. 一键应用（更新规则+启动服务+应用系统DNS）
 ```
 
-内置示例规则：
+内置可选规则分组：
 
 ```txt
 YouTube
+Netflix
+Disney
+TikTok
+Telegram
+OpenAI
+Claude
+Gemini
 ```
 
-规则来源：
+规则链接会自动推导为：
 
 ```txt
-https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/refs/heads/master/rule/Clash/YouTube/YouTube.list
+https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/refs/heads/master/rule/Clash/<分组名>/<分组名>.list
+```
+
+例如选择 `Netflix` 会自动使用（脚本内部推导，不需要你手填）：
+
+```txt
+https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/refs/heads/master/rule/Clash/Netflix/Netflix.list
 ```
 
 ---
