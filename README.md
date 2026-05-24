@@ -87,7 +87,7 @@ wget -O dnsproxy-unlock.sh https://raw.githubusercontent.com/pjy02/dnsproxy-unlo
 ```txt
 1. 安装 / 更新 dnsproxy
 3. 在线规则分组管理
-   -> 添加内置在线规则链接
+   -> 选择内置规则分组（可多选）
    -> 选择 YouTube
    -> 输入你的解锁 DNS / DoH
 4. 更新并转换在线规则
@@ -137,13 +137,13 @@ AdGuard dnsproxy 在线规则 DNS 分流解锁脚本
 可以选择：
 
 ```txt
-1. 选择内置规则分组（自动 URL）
+1. 选择内置规则分组（支持多选/全选）
 2. 添加自定义分组（可自动推导 URL）
 3. 删除规则分组
 4. 更新并转换在线规则
 ```
 
-内置可选规则分组（示例）：
+内置可选规则分组：
 
 ```txt
 YouTube
@@ -162,7 +162,7 @@ Gemini
 https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/refs/heads/master/rule/Clash/<分组名>/<分组名>.list
 ```
 
-例如选择 `Netflix` 会自动使用：
+例如选择 `Netflix` 会自动使用（脚本内部推导，不需要你手填）：
 
 ```txt
 https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/refs/heads/master/rule/Clash/Netflix/Netflix.list

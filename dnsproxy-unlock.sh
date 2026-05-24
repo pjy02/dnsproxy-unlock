@@ -316,7 +316,7 @@ validate_upstream() {
   # IPv4:port
   if [[ "$upstream" =~ ^(([0-9]{1,3}\.){3}[0-9]{1,3}):([0-9]{1,5})$ ]]; then
     local ip="${BASH_REMATCH[1]}"
-    local port="${BASH_REMATCH[4]}"
+    local port="${BASH_REMATCH[3]}"
     is_valid_ipv4 "$ip" || return 1
     (( port >= 1 && port <= 65535 )) || return 1
     return 0
@@ -725,7 +725,6 @@ list_rule_sources() {
 
     n=$((n + 1))
     echo "${n}. 分组：$group"
-    echo "   URL：$url"
     echo "   上游：$upstream"
     echo
   done < "$SOURCE_FILE"
@@ -743,45 +742,76 @@ build_builtin_rule_url() {
 }
 
 add_builtin_rule_source() {
-  local i group url upstream
+  local i selected upstream group url idx token
 
   echo
-  echo "可选内置规则分组（自动推导 URL）："
+  echo "可选内置规则分组："
   echo "------------------------------------------------------------"
-
   for i in "${!BUILTIN_RULE_NAMES[@]}"; do
-    group="${BUILTIN_RULE_NAMES[$i]}"
-    url="$(build_builtin_rule_url "$group")"
-    echo "$((i + 1)). $group"
-    echo "   $url"
+    echo "$((i + 1)). ${BUILTIN_RULE_NAMES[$i]}"
   done
-
+  echo "a. 全选内置分组"
+  echo "v. 查看某个分组的规则 URL"
   echo "0. 返回"
   echo
+  echo "支持多选：例如 1,2,6 或 1 2 6"
+  read -rp "请选择规则分组: " selected
+  selected="$(trim "$selected")"
 
-  read -rp "请选择规则分组: " choice
+  [[ -z "$selected" || "$selected" == "0" ]] && return 0
 
-  if [[ "$choice" == "0" ]]; then
+  if [[ "$selected" =~ ^[Vv]$ ]]; then
+    read -rp "输入分组编号查看 URL: " token
+    if [[ "$token" =~ ^[0-9]+$ ]]; then
+      idx=$((token - 1))
+      if (( idx >= 0 && idx < ${#BUILTIN_RULE_NAMES[@]} )); then
+        group="${BUILTIN_RULE_NAMES[$idx]}"
+        info "$group -> $(build_builtin_rule_url "$group")"
+      else
+        warn "编号无效"
+      fi
+    else
+      warn "编号无效"
+    fi
     return 0
   fi
 
-  if ! [[ "$choice" =~ ^[0-9]+$ ]]; then
-    warn "无效选项"
-    return 1
-  fi
-
-  local idx=$((choice - 1))
-  if (( idx < 0 || idx >= ${#BUILTIN_RULE_NAMES[@]} )); then
-    warn "无效选项"
-    return 1
-  fi
-
-  group="${BUILTIN_RULE_NAMES[$idx]}"
-  url="$(build_builtin_rule_url "$group")"
   upstream="$(ask_unlock_upstream)"
 
-  upsert_rule_source "$group" "$url" "$upstream"
-  ok "已添加 / 更新规则源：$group"
+  if [[ "$selected" =~ ^[Aa]$ ]]; then
+    for i in "${!BUILTIN_RULE_NAMES[@]}"; do
+      group="${BUILTIN_RULE_NAMES[$i]}"
+      url="$(build_builtin_rule_url "$group")"
+      upsert_rule_source "$group" "$url" "$upstream"
+    done
+    ok "已批量添加全部内置分组"
+    return 0
+  fi
+
+  selected="${selected//,/ }"
+  local added=0
+  for token in $selected; do
+    if ! [[ "$token" =~ ^[0-9]+$ ]]; then
+      warn "已跳过无效输入：$token"
+      continue
+    fi
+    idx=$((token - 1))
+    if (( idx < 0 || idx >= ${#BUILTIN_RULE_NAMES[@]} )); then
+      warn "已跳过无效编号：$token"
+      continue
+    fi
+    group="${BUILTIN_RULE_NAMES[$idx]}"
+    url="$(build_builtin_rule_url "$group")"
+    upsert_rule_source "$group" "$url" "$upstream"
+    added=$((added + 1))
+  done
+
+  if (( added == 0 )); then
+    warn "没有成功添加任何分组"
+    return 1
+  fi
+
+  ok "已添加 / 更新 ${added} 个内置分组"
 }
 
 add_custom_rule_source() {
@@ -792,9 +822,7 @@ add_custom_rule_source() {
   echo " 添加自定义在线规则源"
   echo "============================================================"
   echo
-  echo "你可以直接输入分组名自动推导 URL，例如：Netflix / YouTube / OpenAI"
-  echo "自动推导格式：${BUILTIN_RULE_BASE_URL}/<Group>/<Group>.list"
-  echo
+  echo "可只输入分组名自动推导 URL（默认开启）。"
 
   read -rp "请输入分组名称，例如 Netflix / ChatGPT / YouTube: " group
   group="$(trim "$group")"
@@ -810,11 +838,9 @@ add_custom_rule_source() {
 
   if [[ "$auto_url" =~ ^[Yy]$ ]]; then
     url="$(build_builtin_rule_url "$group")"
-    info "已推导规则 URL：$url"
   else
     read -rp "请输入在线规则 URL: " url
     url="$(trim "$url")"
-
     if [[ ! "$url" =~ ^https?:// ]]; then
       err "规则 URL 必须以 http:// 或 https:// 开头"
       pause
@@ -823,7 +849,6 @@ add_custom_rule_source() {
   fi
 
   upstream="$(ask_unlock_upstream)"
-
   upsert_rule_source "$group" "$url" "$upstream"
   ok "已添加 / 更新自定义规则源：$group"
 }
