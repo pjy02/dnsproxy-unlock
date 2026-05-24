@@ -41,6 +41,7 @@ RED="\033[0;31m"
 GREEN="\033[0;32m"
 YELLOW="\033[0;33m"
 BLUE="\033[0;34m"
+CYAN="\033[0;36m"
 NC="\033[0m"
 
 # 内置规则分组（可直接选择，无需手填 URL）
@@ -1862,43 +1863,73 @@ main_menu() {
   install_menu_command
 
   while true; do
+    local install_status run_status sys_dns_status
+    install_status="$(get_dnsproxy_install_status)"
+    run_status="$(get_dnsproxy_run_status)"
+    sys_dns_status="$(get_system_dnsproxy_usage_status)"
+
+    local install_icon run_icon dns_icon
+    if [[ "$install_status" == "已安装" ]]; then
+      install_icon="${GREEN}●${NC} 已安装"
+    else
+      install_icon="${RED}●${NC} 未安装"
+    fi
+    if [[ "$run_status" == "运行中" ]]; then
+      run_icon="${GREEN}●${NC} 运行中"
+    else
+      run_icon="${RED}●${NC} 未运行"
+    fi
+    if [[ "$sys_dns_status" == "已使用" ]]; then
+      dns_icon="${GREEN}●${NC} 已接管"
+    else
+      dns_icon="${YELLOW}●${NC} 未接管"
+    fi
+
     clear
-    echo "============================================================"
-    echo " AdGuard dnsproxy 在线规则 DNS 分流解锁脚本"
-    echo "============================================================"
+    echo -e "${CYAN}"
+    echo "  ╔══════════════════════════════════════════════════════════════╗"
+    echo "  ║                                                              ║"
+    echo "  ║       ┌─ AdGuard dnsproxy ── DNS 分流解锁管理 ─┐            ║"
+    echo "  ║       └────────────────────────────────────────┘            ║"
+    echo "  ║                                                              ║"
+    echo "  ╚══════════════════════════════════════════════════════════════╝"
+    echo -e "${NC}"
+    echo -e "  安装  ${install_icon}   运行  ${run_icon}   系统DNS  ${dns_icon}"
     echo
-    echo "推荐获取 DNS 解锁服务："
-    echo "1. https://dns.akile.ai/"
-    echo "2. https://gaidns.com/"
+    echo -e "  ${BLUE}┌──────────────────────────────────────────────────────────┐${NC}"
+    echo -e "  ${BLUE}│${NC}  ${CYAN}◈ 推荐 DNS 解锁服务${NC}                                      ${BLUE}│${NC}"
+    echo -e "  ${BLUE}│${NC}    ${YELLOW}▸${NC} AKile DNS   ${GREEN}https://dns.akile.ai/${NC}                   ${BLUE}│${NC}"
+    echo -e "  ${BLUE}│${NC}    ${YELLOW}▸${NC} GaiDNS      ${GREEN}https://gaidns.com/${NC}                    ${BLUE}│${NC}"
+    echo -e "  ${BLUE}│${NC}  ${CYAN}◈ 说明${NC}                                                   ${BLUE}│${NC}"
+    echo -e "  ${BLUE}│${NC}    ${YELLOW}▸${NC} 本脚本不内置解锁 DNS，需自行从服务商获取                ${BLUE}│${NC}"
+    echo -e "  ${BLUE}│${NC}    ${YELLOW}▸${NC} 普通公共 DNS (如 1.1.1.1) 不是解锁 DNS                 ${BLUE}│${NC}"
+    echo -e "  ${BLUE}└──────────────────────────────────────────────────────────┘${NC}"
     echo
-    echo "说明："
-    echo "- 本脚本不内置默认解锁 DNS / DoH。"
-    echo "- 解锁上游需要你自己从服务商获取并输入。"
-    echo "- 普通 IPv4 DNS 例如 1.1.1.1 支持作为 dnsproxy 上游。"
-    echo "- 但 1.1.1.1 是普通公共 DNS，不是解锁 DNS。"
-    echo
-    echo "当前状态：dnsproxy安装=$(get_dnsproxy_install_status) / dnsproxy运行=$(get_dnsproxy_run_status) / 系统使用dnsproxy解析=$(get_system_dnsproxy_usage_status)"
-    echo
-    echo "菜单："
-    echo "1. 安装 / 更新 dnsproxy"
-    echo "2. 配置普通默认 DNS"
-    echo "3. 在线规则分组管理"
-    echo "4. 一键应用（更新规则 + 启动服务 + 应用系统DNS）"
-    echo "5. 启动 / 重启 dnsproxy"
-    echo "6. 停止 dnsproxy"
-    echo "7. 恢复系统 DNS 备份"
-    echo "8. 测试域名解析"
-    echo "9. 查看状态"
-    echo "10. 查看日志"
-    echo "11. 预览生成的 upstream 规则"
-    echo "12. 查看被忽略的规则"
-    echo "13. 启用规则自动更新"
-    echo "14. 禁用规则自动更新"
-    echo "15. 卸载 dnsproxy"
-    echo "0. 退出"
+    echo -e "  ${CYAN}╔══ 安装与配置 ═════════════════════════════════════════════╗${NC}"
+    echo -e "  ${CYAN}║${NC}  ${GREEN} 1)${NC} 安装 / 更新 dnsproxy                                ${CYAN}║${NC}"
+    echo -e "  ${CYAN}║${NC}  ${GREEN} 2)${NC} 配置普通默认 DNS                                     ${CYAN}║${NC}"
+    echo -e "  ${CYAN}║${NC}  ${GREEN} 3)${NC} 在线规则分组管理                                     ${CYAN}║${NC}"
+    echo -e "  ${CYAN}║${NC}  ${GREEN} 4)${NC} 一键应用（更新规则 + 启动服务 + 应用系统 DNS）       ${CYAN}║${NC}"
+    echo -e "  ${CYAN}╠══ 服务控制 ═══════════════════════════════════════════════╣${NC}"
+    echo -e "  ${CYAN}║${NC}  ${GREEN} 5)${NC} 启动 / 重启 dnsproxy                                ${CYAN}║${NC}"
+    echo -e "  ${CYAN}║${NC}  ${GREEN} 6)${NC} 停止 dnsproxy                                        ${CYAN}║${NC}"
+    echo -e "  ${CYAN}║${NC}  ${GREEN} 7)${NC} 恢复系统 DNS 备份                                    ${CYAN}║${NC}"
+    echo -e "  ${CYAN}╠══ 查看与调试 ═════════════════════════════════════════════╣${NC}"
+    echo -e "  ${CYAN}║${NC}  ${GREEN} 8)${NC} 测试域名解析                                         ${CYAN}║${NC}"
+    echo -e "  ${CYAN}║${NC}  ${GREEN} 9)${NC} 查看状态                                             ${CYAN}║${NC}"
+    echo -e "  ${CYAN}║${NC}  ${GREEN}10)${NC} 查看日志                                             ${CYAN}║${NC}"
+    echo -e "  ${CYAN}║${NC}  ${GREEN}11)${NC} 预览生成的 upstream 规则                              ${CYAN}║${NC}"
+    echo -e "  ${CYAN}║${NC}  ${GREEN}12)${NC} 查看被忽略的规则                                     ${CYAN}║${NC}"
+    echo -e "  ${CYAN}╠══ 高级功能 ═══════════════════════════════════════════════╣${NC}"
+    echo -e "  ${CYAN}║${NC}  ${GREEN}13)${NC} 启用规则自动更新（systemd timer）                    ${CYAN}║${NC}"
+    echo -e "  ${CYAN}║${NC}  ${GREEN}14)${NC} 禁用规则自动更新                                     ${CYAN}║${NC}"
+    echo -e "  ${CYAN}║${NC}  ${RED}15)${NC} 卸载 dnsproxy                                        ${CYAN}║${NC}"
+    echo -e "  ${CYAN}╠════════════════════════════════════════════════════════════╣${NC}"
+    echo -e "  ${CYAN}║${NC}  ${YELLOW} 0)${NC} 退出                                                ${CYAN}║${NC}"
+    echo -e "  ${CYAN}╚════════════════════════════════════════════════════════════╝${NC}"
     echo
 
-    read -rp "请输入选项: " choice
+    read -rp "  请输入选项: " choice
 
     case "$choice" in
       1)
