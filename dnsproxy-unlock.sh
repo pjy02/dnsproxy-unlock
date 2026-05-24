@@ -499,6 +499,18 @@ install_or_update_dnsproxy() {
   rm -rf "$tmp"
 
   create_default_config_if_missing
+
+  info "安装流程：自动配置普通默认 DNS（根据 IPv4 / IPv6 使用 Cloudflare + Google）"
+  local auto_default_upstreams
+  if auto_default_upstreams="$(build_auto_default_upstreams)"; then
+    save_config_value "DEFAULT_UPSTREAMS" "$auto_default_upstreams"
+    save_config_value "BOOTSTRAP_UPSTREAMS" "$auto_default_upstreams"
+    ok "普通默认 DNS 已自动配置：$auto_default_upstreams"
+  else
+    warn "普通默认 DNS 自动配置失败，保留当前配置。"
+    warn "安装完成后可进入菜单 2 手动配置普通默认 DNS。"
+  fi
+
   install_menu_command
   create_runner
   create_systemd_service
