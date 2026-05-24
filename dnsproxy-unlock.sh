@@ -1504,6 +1504,53 @@ disable_update_timer() {
 # ============================================================
 
 
+# 询问是否锁定 /etc/resolv.conf，防止重启或网络服务覆盖。
+ask_lock_resolv_conf() {
+  echo
+  read -rp "是否锁定 /etc/resolv.conf 防止被覆盖？不建议默认开启。[y/N]: " lock_confirm
+  lock_confirm="${lock_confirm:-N}"
+
+  if [[ "$lock_confirm" =~ ^[Yy]$ ]]; then
+    if command -v chattr >/dev/null 2>&1; then
+      if chattr +i "$RESOLV_CONF" 2>/dev/null; then
+        ok "已锁定 /etc/resolv.conf"
+        warn "以后要修改 DNS，请先执行：chattr -i /etc/resolv.conf"
+      else
+        warn "锁定 /etc/resolv.conf 失败，可能是文件系统不支持 chattr +i。"
+        return 1
+      fi
+    else
+      warn "系统没有 chattr，无法锁定 /etc/resolv.conf。"
+      return 1
+    fi
+  else
+    ok "未锁定 /etc/resolv.conf"
+  fi
+
+  return 0
+}
+
+get_resolv_conf_lock_status() {
+  if [[ ! -e "$RESOLV_CONF" ]]; then
+    echo "不存在"
+    return 0
+  fi
+
+  if ! command -v lsattr >/dev/null 2>&1; then
+    echo "未知（系统无 lsattr）"
+    return 0
+  fi
+
+  local attrs
+  attrs="$(lsattr "$RESOLV_CONF" 2>/dev/null | awk '{print $1}' || true)"
+
+  if [[ "$attrs" == *i* ]]; then
+    echo "已锁定"
+  else
+    echo "未锁定"
+  fi
+}
+
 apply_rules_and_enable_system_dns() {
   require_root
 
@@ -1557,6 +1604,7 @@ options edns0 trust-ad
 EOF
 
   ok "已应用系统 DNS 到 ${LISTEN_ADDR}"
+  ask_lock_resolv_conf || true
   return 0
 }
 
@@ -1617,19 +1665,7 @@ EOF
 
   ok "已写入 $RESOLV_CONF"
 
-  echo
-  read -rp "是否锁定 /etc/resolv.conf 防止被覆盖？不建议默认开启。[y/N]: " lock_confirm
-  lock_confirm="${lock_confirm:-N}"
-
-  if [[ "$lock_confirm" =~ ^[Yy]$ ]]; then
-    if command -v chattr >/dev/null 2>&1; then
-      chattr +i "$RESOLV_CONF"
-      ok "已锁定 /etc/resolv.conf"
-      warn "以后要修改 DNS，请先执行：chattr -i /etc/resolv.conf"
-    else
-      warn "系统没有 chattr，无法锁定。"
-    fi
-  fi
+  ask_lock_resolv_conf || true
 
   pause
 }
@@ -1674,6 +1710,23 @@ get_dnsproxy_run_status() {
     echo "运行中"
   else
     echo "未运行"
+  fi
+}
+
+get_rule_update_timer_status() {
+  if ! command -v systemctl >/dev/null 2>&1; then
+    echo "未知"
+    return 0
+  fi
+
+  if systemctl is-enabled --quiet dnsproxy-rule-update.timer 2>/dev/null; then
+    if systemctl is-active --quiet dnsproxy-rule-update.timer 2>/dev/null; then
+      echo "已启用"
+    else
+      echo "已启用但未运行"
+    fi
+  else
+    echo "未启用"
   fi
 }
 
@@ -1724,8 +1777,10 @@ show_status() {
   echo "实时状态总览："
   echo "- dnsproxy 安装状态：$(get_dnsproxy_install_status)"
   echo "- dnsproxy 运行状态：$(get_dnsproxy_run_status)"
+  echo "- 规则自动更新状态：$(get_rule_update_timer_status)"
   echo "- 系统是否使用 dnsproxy 解析：$(get_system_dnsproxy_usage_status)"
   echo "- 当前系统 DNS：$(get_system_dns_status)"
+  echo "- resolv.conf 锁定状态：$(get_resolv_conf_lock_status)"
   echo "- DNS 解析模式：$(get_dns_resolution_mode)"
   echo
 
@@ -1978,12 +2033,13 @@ main_menu() {
   install_menu_command
 
   while true; do
-    local install_status run_status sys_dns_status
+    local install_status run_status sys_dns_status timer_status
     install_status="$(get_dnsproxy_install_status)"
     run_status="$(get_dnsproxy_run_status)"
     sys_dns_status="$(get_system_dnsproxy_usage_status)"
+    timer_status="$(get_rule_update_timer_status)"
 
-    local install_icon run_icon dns_icon
+    local install_icon run_icon dns_icon timer_icon
     if [[ "$install_status" == "已安装" ]]; then
       install_icon="${GREEN}●${NC} 已安装"
     else
@@ -1999,6 +2055,13 @@ main_menu() {
     else
       dns_icon="${YELLOW}●${NC} 未接管"
     fi
+    if [[ "$timer_status" == "已启用" ]]; then
+      timer_icon="${GREEN}●${NC} 已启用"
+    elif [[ "$timer_status" == "已启用但未运行" ]]; then
+      timer_icon="${YELLOW}●${NC} 已启用但未运行"
+    else
+      timer_icon="${YELLOW}●${NC} 未启用"
+    fi
 
     clear
     menu_cyan_fixed_right "╔══════════════════════════════════════════════════════" "╗"
@@ -2012,15 +2075,13 @@ main_menu() {
     menu_blue_line 0 "  dnsproxy 安装状态：${install_icon}"
     menu_blue_line 0 "  dnsproxy 运行状态：${run_icon}"
     menu_blue_line 0 "  系统 DNS 接管状态：${dns_icon}"
+    menu_blue_line 0 "  规则自动更新状态：${timer_icon}"
     menu_blue_fixed_right "└──────────────────────────────────────────────────────" "┘"
     echo
     menu_blue_fixed_right "┌──────────────────────────────────────────────────────" "┐"
     menu_blue_line 0 "  ${CYAN}◈ 推荐 DNS 解锁服务${NC}"
     menu_blue_line 0 "    ${YELLOW}▸${NC} AKile DNS   ${GREEN}https://dns.akile.ai/${NC}"
     menu_blue_line 0 "    ${YELLOW}▸${NC} GaiDNS      ${GREEN}https://gaidns.com/${NC}"
-    menu_blue_line 0 "  ${CYAN}◈ 说明${NC}"
-    menu_blue_line 0 "    ${YELLOW}▸${NC} 本脚本不内置解锁 DNS，需自行从服务商获取"
-    menu_blue_line 0 "    ${YELLOW}▸${NC} 普通公共 DNS（如 1.1.1.1）不是解锁 DNS"
     menu_blue_fixed_right "└──────────────────────────────────────────────────────" "┘"
     echo
     menu_cyan_fixed_right "╔══ 安装与配置 ════════════════════════════════════════" "╗"
