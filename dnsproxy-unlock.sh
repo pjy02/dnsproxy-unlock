@@ -33,6 +33,8 @@ RESOLV_CONF="/etc/resolv.conf"
 RESOLV_BACKUP="/etc/resolv.conf.bak.dnsproxy"
 
 DNSPROXY_FALLBACK_VERSION="v0.79.0"
+MENU_SCRIPT_PATH="${APP_DIR}/dnsproxy-unlock.sh"
+DNS_CMD_PATH="/usr/local/bin/dns"
 
 RED="\033[0;31m"
 GREEN="\033[0;32m"
@@ -425,6 +427,7 @@ install_or_update_dnsproxy() {
   rm -rf "$tmp"
 
   create_default_config_if_missing
+  install_menu_command
   create_runner
   create_systemd_service
 
@@ -442,6 +445,21 @@ install_or_update_dnsproxy() {
     systemctl restart dnsproxy
     ok "dnsproxy 已启动"
   fi
+}
+
+
+install_menu_command() {
+  ensure_dir
+
+  install -m 0755 "$0" "$MENU_SCRIPT_PATH"
+
+  cat > "$DNS_CMD_PATH" << 'EOF'
+#!/usr/bin/env bash
+exec "/opt/dnsproxy/dnsproxy-unlock.sh" "$@"
+EOF
+
+  chmod +x "$DNS_CMD_PATH"
+  ok "已创建命令：dns -> $DNS_CMD_PATH"
 }
 
 create_runner() {
@@ -1469,6 +1487,7 @@ uninstall_dnsproxy() {
   systemctl disable --now dnsproxy-rule-update.timer 2>/dev/null || true
 
   rm -f "$SERVICE_FILE" "$UPDATE_SERVICE_FILE" "$UPDATE_TIMER_FILE"
+  rm -f "$DNS_CMD_PATH" "$MENU_SCRIPT_PATH"
   systemctl daemon-reload
 
   read -rp "是否恢复 /etc/resolv.conf 备份？[Y/n]: " restore
