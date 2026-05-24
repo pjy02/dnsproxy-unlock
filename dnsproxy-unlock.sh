@@ -451,11 +451,13 @@ install_or_update_dnsproxy() {
 install_menu_command() {
   ensure_dir
 
-  install -m 0755 "$0" "$MENU_SCRIPT_PATH"
+  local script_source
+  script_source="$(readlink -f -- "${BASH_SOURCE[0]}")"
+  install -m 0755 "$script_source" "$MENU_SCRIPT_PATH"
 
-  cat > "$DNS_CMD_PATH" << 'EOF'
+  cat > "$DNS_CMD_PATH" << EOF
 #!/usr/bin/env bash
-exec "/opt/dnsproxy/dnsproxy-unlock.sh" "$@"
+exec "${MENU_SCRIPT_PATH}" "$@"
 EOF
 
   chmod +x "$DNS_CMD_PATH"
@@ -916,9 +918,11 @@ is_valid_domain() {
 
   [[ -n "$domain" ]] || return 1
 
-  # 去除常见前缀
+  # 去除常见前缀（仅处理 +. 和 *.）
   domain="${domain#+.}"
-  domain="${domain#*.}"
+  if [[ "$domain" == \*.* ]]; then
+    domain="${domain#*.}"
+  fi
 
   [[ -n "$domain" ]] || return 1
 
@@ -948,7 +952,9 @@ clean_domain_value() {
 
   # 去掉通配和 +. 前缀
   domain="${domain#+.}"
-  domain="${domain#*.}"
+  if [[ "$domain" == \*.* ]]; then
+    domain="${domain#*.}"
+  fi
 
   echo "$domain"
 }
@@ -1165,7 +1171,7 @@ EOF
 
   cat > "${APP_DIR}/update-rules.sh" << EOF
 #!/usr/bin/env bash
-exec "$0" --update-rules
+exec "${MENU_SCRIPT_PATH}" --update-rules
 EOF
 
   chmod +x "${APP_DIR}/update-rules.sh"
