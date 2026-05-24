@@ -1462,6 +1462,18 @@ get_dns_resolution_mode() {
   fi
 }
 
+get_system_dnsproxy_usage_status() {
+  load_config
+  local ns
+  ns="$(get_system_dns_status)"
+
+  if [[ "$ns" == "${LISTEN_ADDR}" && "${LISTEN_PORT}" == "53" ]]; then
+    echo "已使用"
+  else
+    echo "未使用"
+  fi
+}
+
 show_status() {
   echo
   echo "================================================------------"
@@ -1470,6 +1482,7 @@ show_status() {
   echo "实时状态总览："
   echo "- dnsproxy 安装状态：$(get_dnsproxy_install_status)"
   echo "- dnsproxy 运行状态：$(get_dnsproxy_run_status)"
+  echo "- 系统是否使用 dnsproxy 解析：$(get_system_dnsproxy_usage_status)"
   echo "- 当前系统 DNS：$(get_system_dns_status)"
   echo "- DNS 解析模式：$(get_dns_resolution_mode)"
   echo
@@ -1695,7 +1708,7 @@ main_menu() {
     echo "- 普通 IPv4 DNS 例如 1.1.1.1 支持作为 dnsproxy 上游。"
     echo "- 但 1.1.1.1 是普通公共 DNS，不是解锁 DNS。"
     echo
-    echo "当前状态：安装=$(get_dnsproxy_install_status) / 运行=$(get_dnsproxy_run_status) / DNS模式=$(get_dns_resolution_mode)"
+    echo "当前状态：dnsproxy安装=$(get_dnsproxy_install_status) / dnsproxy运行=$(get_dnsproxy_run_status) / 系统使用dnsproxy解析=$(get_system_dnsproxy_usage_status)"
     echo
     echo "菜单："
     echo "1. 安装 / 更新 dnsproxy"
