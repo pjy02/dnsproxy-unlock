@@ -69,13 +69,13 @@ udp://1.2.3.4
 推荐使用下面命令下载脚本并运行：
 
 ```bash
-curl -fsSL -o dnsproxy-unlock.sh https://raw.githubusercontent.com/pjy02/dnsproxy-unlock./refs/heads/main/dnsproxy-unlock.sh && chmod +x dnsproxy-unlock.sh && sudo ./dnsproxy-unlock.sh
+curl -fsSL -o dnsproxy-unlock.sh https://raw.githubusercontent.com/pjy02/dnsproxy-unlock/refs/heads/main/dnsproxy-unlock.sh && chmod +x dnsproxy-unlock.sh && sudo ./dnsproxy-unlock.sh
 ```
 
 或者使用 `wget`：
 
 ```bash
-wget -O dnsproxy-unlock.sh https://raw.githubusercontent.com/pjy02/dnsproxy-unlock./refs/heads/main/dnsproxy-unlock.sh && chmod +x dnsproxy-unlock.sh && sudo ./dnsproxy-unlock.sh
+wget -O dnsproxy-unlock.sh https://raw.githubusercontent.com/pjy02/dnsproxy-unlock/refs/heads/main/dnsproxy-unlock.sh && chmod +x dnsproxy-unlock.sh && sudo ./dnsproxy-unlock.sh
 ```
 
 ---

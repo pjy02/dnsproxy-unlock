@@ -33,6 +33,8 @@ RESOLV_CONF="/etc/resolv.conf"
 RESOLV_BACKUP="/etc/resolv.conf.bak.dnsproxy"
 
 DNSPROXY_FALLBACK_VERSION="v0.79.0"
+MENU_SCRIPT_PATH="${APP_DIR}/dnsproxy-unlock.sh"
+DNS_CMD_PATH="/usr/local/bin/dns"
 
 RED="\033[0;31m"
 GREEN="\033[0;32m"
@@ -425,6 +427,7 @@ install_or_update_dnsproxy() {
   rm -rf "$tmp"
 
   create_default_config_if_missing
+  install_menu_command
   create_runner
   create_systemd_service
 
@@ -442,6 +445,23 @@ install_or_update_dnsproxy() {
     systemctl restart dnsproxy
     ok "dnsproxy 已启动"
   fi
+}
+
+
+install_menu_command() {
+  ensure_dir
+
+  local script_source
+  script_source="$(readlink -f -- "${BASH_SOURCE[0]}")"
+  install -m 0755 "$script_source" "$MENU_SCRIPT_PATH"
+
+  cat > "$DNS_CMD_PATH" << EOF
+#!/usr/bin/env bash
+exec "${MENU_SCRIPT_PATH}" "$@"
+EOF
+
+  chmod +x "$DNS_CMD_PATH"
+  ok "已创建命令：dns -> $DNS_CMD_PATH"
 }
 
 create_runner() {
@@ -898,9 +918,11 @@ is_valid_domain() {
 
   [[ -n "$domain" ]] || return 1
 
-  # 去除常见前缀
+  # 去除常见前缀（仅处理 +. 和 *.）
   domain="${domain#+.}"
-  domain="${domain#*.}"
+  if [[ "$domain" == \*.* ]]; then
+    domain="${domain#*.}"
+  fi
 
   [[ -n "$domain" ]] || return 1
 
@@ -930,7 +952,9 @@ clean_domain_value() {
 
   # 去掉通配和 +. 前缀
   domain="${domain#+.}"
-  domain="${domain#*.}"
+  if [[ "$domain" == \*.* ]]; then
+    domain="${domain#*.}"
+  fi
 
   echo "$domain"
 }
@@ -1147,7 +1171,7 @@ EOF
 
   cat > "${APP_DIR}/update-rules.sh" << EOF
 #!/usr/bin/env bash
-exec "$0" --update-rules
+exec "${MENU_SCRIPT_PATH}" --update-rules
 EOF
 
   chmod +x "${APP_DIR}/update-rules.sh"
@@ -1469,6 +1493,7 @@ uninstall_dnsproxy() {
   systemctl disable --now dnsproxy-rule-update.timer 2>/dev/null || true
 
   rm -f "$SERVICE_FILE" "$UPDATE_SERVICE_FILE" "$UPDATE_TIMER_FILE"
+  rm -f "$DNS_CMD_PATH" "$MENU_SCRIPT_PATH"
   systemctl daemon-reload
 
   read -rp "是否恢复 /etc/resolv.conf 备份？[Y/n]: " restore
@@ -1497,6 +1522,9 @@ uninstall_dnsproxy() {
 main_menu() {
   require_root
   create_default_config_if_missing
+
+  # 确保首次运行脚本后即可直接使用 `dns` 命令再次打开菜单
+  install_menu_command
 
   while true; do
     clear
