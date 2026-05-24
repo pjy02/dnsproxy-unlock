@@ -284,6 +284,13 @@ normalize_upstream() {
     return 0
   fi
 
+  # 纯 IPv6 自动补成 [IPv6]:53，避免与端口分隔符混淆。
+  # 已带协议的 DoH/DoT/DoQ/TCP/UDP 不处理。
+  if [[ "$upstream" != *"://"* && "$upstream" != \[*\] && "$upstream" =~ ^[0-9A-Fa-f:]+$ && "$upstream" == *:* ]]; then
+    echo "[${upstream}]:53"
+    return 0
+  fi
+
   echo "$upstream"
 }
 
@@ -332,6 +339,19 @@ validate_upstream() {
     local port="${BASH_REMATCH[3]}"
     is_valid_ipv4 "$ip" || return 1
     (( port >= 1 && port <= 65535 )) || return 1
+    return 0
+  fi
+
+  # IPv6，推荐格式：[2606:4700:4700::1111]:53
+  if [[ "$upstream" =~ ^\[([0-9A-Fa-f:]+)\]:([0-9]{1,5})$ ]]; then
+    local port="${BASH_REMATCH[2]}"
+    [[ "${BASH_REMATCH[1]}" == *:* ]] || return 1
+    (( port >= 1 && port <= 65535 )) || return 1
+    return 0
+  fi
+
+  # 纯 IPv6，不带端口。normalize_upstream 会自动转成 [IPv6]:53。
+  if [[ "$upstream" =~ ^[0-9A-Fa-f:]+$ && "$upstream" == *:* ]]; then
     return 0
   fi
 
@@ -770,6 +790,55 @@ handle_port_conflict() {
 
 
 # ============================================================
+# 普通默认 DNS 自动检测
+# ============================================================
+
+has_ipv4_network() {
+  if command -v ip >/dev/null 2>&1; then
+    ip -4 route get 1.1.1.1 >/dev/null 2>&1 && return 0
+    ip -4 addr show scope global 2>/dev/null | grep -q 'inet ' && return 0
+  fi
+
+  return 1
+}
+
+has_ipv6_network() {
+  if command -v ip >/dev/null 2>&1; then
+    ip -6 route get 2606:4700:4700::1111 >/dev/null 2>&1 && return 0
+    if ip -6 route show default 2>/dev/null | grep -q '^default' && \
+       ip -6 addr show scope global 2>/dev/null | grep -q 'inet6 '; then
+      return 0
+    fi
+  fi
+
+  return 1
+}
+
+build_auto_default_upstreams() {
+  local -a upstream_list=()
+  local has_v4="否"
+  local has_v6="否"
+
+  if has_ipv4_network; then
+    has_v4="是"
+    upstream_list+=("1.1.1.1:53" "8.8.8.8:53")
+  fi
+
+  if has_ipv6_network; then
+    has_v6="是"
+    upstream_list+=("[2606:4700:4700::1111]:53" "[2001:4860:4860::8888]:53")
+  fi
+
+  info "检测结果：IPv4=${has_v4}，IPv6=${has_v6}" >&2
+
+  if (( ${#upstream_list[@]} == 0 )); then
+    return 1
+  fi
+
+  printf '%s' "${upstream_list[*]}"
+}
+
+# ============================================================
 # 普通默认 DNS 配置
 # ============================================================
 
@@ -789,10 +858,11 @@ configure_default_dns() {
   echo "当前默认 DNS：${DEFAULT_UPSTREAMS:-未配置}"
   echo
   echo "请选择："
-  echo "1. Cloudflare: 1.1.1.1 / 1.0.0.1"
-  echo "2. Google:     8.8.8.8 / 8.8.4.4"
-  echo "3. Quad9:      9.9.9.9 / 149.112.112.112"
-  echo "4. 自定义"
+  echo "1. 自动配置：检测服务器 IPv4 / IPv6，使用 Cloudflare + Google"
+  echo "2. Cloudflare IPv4: 1.1.1.1 / 1.0.0.1"
+  echo "3. Google IPv4:     8.8.8.8 / 8.8.4.4"
+  echo "4. Quad9 IPv4:      9.9.9.9 / 149.112.112.112"
+  echo "5. 自定义"
   echo "0. 返回"
   echo
 
@@ -802,15 +872,24 @@ configure_default_dns() {
 
   case "$choice" in
     1)
-      upstreams="1.1.1.1:53 1.0.0.1:53"
+      if ! upstreams="$(build_auto_default_upstreams)"; then
+        err "自动检测失败：未检测到可用 IPv4 或 IPv6 网络。"
+        warn "请检查服务器网络，或选择自定义 DNS。"
+        pause
+        return 1
+      fi
+      ok "自动配置结果：$upstreams"
       ;;
     2)
-      upstreams="8.8.8.8:53 8.8.4.4:53"
+      upstreams="1.1.1.1:53 1.0.0.1:53"
       ;;
     3)
-      upstreams="9.9.9.9:53 149.112.112.112:53"
+      upstreams="8.8.8.8:53 8.8.4.4:53"
       ;;
     4)
+      upstreams="9.9.9.9:53 149.112.112.112:53"
+      ;;
+    5)
       read -rp "请输入第一个普通 DNS: " dns1
       read -rp "请输入第二个普通 DNS，可留空: " dns2
       dns1="$(normalize_upstream "$dns1")"
@@ -1928,7 +2007,12 @@ main_menu() {
     menu_cyan_line 0 "    └────────────────────────────────────────┘"
     menu_cyan_line 0 ""
     menu_cyan_fixed_right "╚══════════════════════════════════════════════════════" "╝"
-    echo -e "  安装  ${install_icon}   运行  ${run_icon}   系统DNS  ${dns_icon}"
+    echo
+    menu_blue_fixed_right "┌─ 状态总览 ───────────────────────────────────────────" "┐"
+    menu_blue_line 0 "  dnsproxy 安装状态：${install_icon}"
+    menu_blue_line 0 "  dnsproxy 运行状态：${run_icon}"
+    menu_blue_line 0 "  系统 DNS 接管状态：${dns_icon}"
+    menu_blue_fixed_right "└──────────────────────────────────────────────────────" "┘"
     echo
     menu_blue_fixed_right "┌──────────────────────────────────────────────────────" "┐"
     menu_blue_line 0 "  ${CYAN}◈ 推荐 DNS 解锁服务${NC}"
