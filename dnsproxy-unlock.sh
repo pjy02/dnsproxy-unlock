@@ -33,6 +33,8 @@ RESOLV_CONF="/etc/resolv.conf"
 RESOLV_BACKUP="/etc/resolv.conf.bak.dnsproxy"
 
 DNSPROXY_FALLBACK_VERSION="v0.79.0"
+MENU_SCRIPT_PATH="${APP_DIR}/dnsproxy-unlock.sh"
+DNS_CMD_PATH="/usr/local/bin/dns"
 
 RED="\033[0;31m"
 GREEN="\033[0;32m"
@@ -40,15 +42,23 @@ YELLOW="\033[0;33m"
 BLUE="\033[0;34m"
 NC="\033[0m"
 
-# 这里只保存“在线规则 URL”，不保存本地域名规则。
-# 你可以后续自己在菜单里添加更多规则 URL。
+# 内置规则分组（可直接选择，无需手填 URL）
+# URL 统一按 blackmatrix7 规则仓库推导：
+# https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/refs/heads/master/rule/Clash/<Group>/<Group>.list
 BUILTIN_RULE_NAMES=(
   "YouTube"
+  "Netflix"
+  "Disney"
+  "TikTok"
+  "Telegram"
+  "OpenAI"
+  "Claude"
+  "Gemini"
+  "Spotify"
+  "Bahamut"
 )
 
-BUILTIN_RULE_URLS=(
-  "https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/refs/heads/master/rule/Clash/YouTube/YouTube.list"
-)
+BUILTIN_RULE_BASE_URL="https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/refs/heads/master/rule/Clash"
 
 # ============================================================
 # 基础输出
@@ -306,7 +316,7 @@ validate_upstream() {
   # IPv4:port
   if [[ "$upstream" =~ ^(([0-9]{1,3}\.){3}[0-9]{1,3}):([0-9]{1,5})$ ]]; then
     local ip="${BASH_REMATCH[1]}"
-    local port="${BASH_REMATCH[4]}"
+    local port="${BASH_REMATCH[3]}"
     is_valid_ipv4 "$ip" || return 1
     (( port >= 1 && port <= 65535 )) || return 1
     return 0
@@ -319,6 +329,8 @@ validate_upstream() {
 
   return 1
 }
+
+ASKED_UPSTREAM=""
 
 ask_unlock_upstream() {
   local upstream confirm
@@ -360,7 +372,7 @@ ask_unlock_upstream() {
     confirm="${confirm:-Y}"
 
     if [[ "$confirm" =~ ^[Yy]$ ]]; then
-      echo "$upstream"
+      ASKED_UPSTREAM="$upstream"
       return 0
     fi
   done
@@ -425,6 +437,7 @@ install_or_update_dnsproxy() {
   rm -rf "$tmp"
 
   create_default_config_if_missing
+  install_menu_command
   create_runner
   create_systemd_service
 
@@ -442,6 +455,27 @@ install_or_update_dnsproxy() {
     systemctl restart dnsproxy
     ok "dnsproxy 已启动"
   fi
+}
+
+
+install_menu_command() {
+  ensure_dir
+
+  local script_source target_source
+  script_source="$(readlink -f -- "${BASH_SOURCE[0]}")"
+  target_source="$(readlink -f -- "$MENU_SCRIPT_PATH" 2>/dev/null || true)"
+
+  if [[ "$script_source" != "$target_source" ]]; then
+    install -m 0755 "$script_source" "$MENU_SCRIPT_PATH"
+  fi
+
+  cat > "$DNS_CMD_PATH" << EOF
+#!/usr/bin/env bash
+exec "${MENU_SCRIPT_PATH}" "$@"
+EOF
+
+  chmod +x "$DNS_CMD_PATH"
+  ok "已创建命令：dns -> $DNS_CMD_PATH"
 }
 
 create_runner() {
@@ -693,7 +727,6 @@ list_rule_sources() {
 
     n=$((n + 1))
     echo "${n}. 分组：$group"
-    echo "   URL：$url"
     echo "   上游：$upstream"
     echo
   done < "$SOURCE_FILE"
@@ -705,47 +738,83 @@ list_rule_sources() {
   echo "------------------------------------------------------------"
 }
 
+build_builtin_rule_url() {
+  local group="$1"
+  echo "${BUILTIN_RULE_BASE_URL}/${group}/${group}.list"
+}
+
 add_builtin_rule_source() {
-  local i
+  local i selected upstream group url idx token
 
   echo
-  echo "可选内置在线规则链接："
+  echo "可选内置规则分组："
   echo "------------------------------------------------------------"
-
   for i in "${!BUILTIN_RULE_NAMES[@]}"; do
     echo "$((i + 1)). ${BUILTIN_RULE_NAMES[$i]}"
-    echo "   ${BUILTIN_RULE_URLS[$i]}"
   done
-
+  echo "a. 全选内置分组"
+  echo "v. 查看某个分组的规则 URL"
   echo "0. 返回"
   echo
+  echo "支持多选：例如 1,2,6 或 1 2 6"
+  read -rp "请选择规则分组: " selected
+  selected="$(trim "$selected")"
 
-  read -rp "请选择规则分组: " choice
+  [[ -z "$selected" || "$selected" == "0" ]] && return 0
 
-  if [[ "$choice" == "0" ]]; then
+  if [[ "$selected" =~ ^[Vv]$ ]]; then
+    read -rp "输入分组编号查看 URL: " token
+    if [[ "$token" =~ ^[0-9]+$ ]]; then
+      idx=$((token - 1))
+      if (( idx >= 0 && idx < ${#BUILTIN_RULE_NAMES[@]} )); then
+        group="${BUILTIN_RULE_NAMES[$idx]}"
+        info "$group -> $(build_builtin_rule_url "$group")"
+      else
+        warn "编号无效"
+      fi
+    else
+      warn "编号无效"
+    fi
     return 0
   fi
 
-  if ! [[ "$choice" =~ ^[0-9]+$ ]]; then
-    warn "无效选项"
+  ask_unlock_upstream
+  upstream="$ASKED_UPSTREAM"
+
+  if [[ "$selected" =~ ^[Aa]$ ]]; then
+    for i in "${!BUILTIN_RULE_NAMES[@]}"; do
+      group="${BUILTIN_RULE_NAMES[$i]}"
+      url="$(build_builtin_rule_url "$group")"
+      upsert_rule_source "$group" "$url" "$upstream"
+    done
+    ok "已批量添加全部内置分组"
+    return 0
+  fi
+
+  selected="${selected//,/ }"
+  local added=0
+  for token in $selected; do
+    if ! [[ "$token" =~ ^[0-9]+$ ]]; then
+      warn "已跳过无效输入：$token"
+      continue
+    fi
+    idx=$((token - 1))
+    if (( idx < 0 || idx >= ${#BUILTIN_RULE_NAMES[@]} )); then
+      warn "已跳过无效编号：$token"
+      continue
+    fi
+    group="${BUILTIN_RULE_NAMES[$idx]}"
+    url="$(build_builtin_rule_url "$group")"
+    upsert_rule_source "$group" "$url" "$upstream"
+    added=$((added + 1))
+  done
+
+  if (( added == 0 )); then
+    warn "没有成功添加任何分组"
     return 1
   fi
 
-  local idx=$((choice - 1))
-
-  if (( idx < 0 || idx >= ${#BUILTIN_RULE_NAMES[@]} )); then
-    warn "无效选项"
-    return 1
-  fi
-
-  local group="${BUILTIN_RULE_NAMES[$idx]}"
-  local url="${BUILTIN_RULE_URLS[$idx]}"
-  local upstream
-
-  upstream="$(ask_unlock_upstream)"
-
-  upsert_rule_source "$group" "$url" "$upstream"
-  ok "已添加 / 更新规则源：$group"
+  ok "已添加 / 更新 ${added} 个内置分组"
 }
 
 add_custom_rule_source() {
@@ -756,13 +825,7 @@ add_custom_rule_source() {
   echo " 添加自定义在线规则源"
   echo "============================================================"
   echo
-  echo "规则源应为 Clash .list 格式，例如："
-  echo "DOMAIN-SUFFIX,youtube.com"
-  echo "DOMAIN,example.com"
-  echo
-  echo "脚本只转换 DOMAIN / DOMAIN-SUFFIX。"
-  echo "IP-CIDR、DOMAIN-KEYWORD 等会被忽略。"
-  echo
+  echo "可只输入分组名自动推导 URL（默认开启）。"
 
   read -rp "请输入分组名称，例如 Netflix / ChatGPT / YouTube: " group
   group="$(trim "$group")"
@@ -773,17 +836,23 @@ add_custom_rule_source() {
     return 1
   fi
 
-  read -rp "请输入在线规则 URL: " url
-  url="$(trim "$url")"
+  read -rp "是否按分组名自动推导规则 URL？[Y/n]: " auto_url
+  auto_url="${auto_url:-Y}"
 
-  if [[ ! "$url" =~ ^https?:// ]]; then
-    err "规则 URL 必须以 http:// 或 https:// 开头"
-    pause
-    return 1
+  if [[ "$auto_url" =~ ^[Yy]$ ]]; then
+    url="$(build_builtin_rule_url "$group")"
+  else
+    read -rp "请输入在线规则 URL: " url
+    url="$(trim "$url")"
+    if [[ ! "$url" =~ ^https?:// ]]; then
+      err "规则 URL 必须以 http:// 或 https:// 开头"
+      pause
+      return 1
+    fi
   fi
 
-  upstream="$(ask_unlock_upstream)"
-
+  ask_unlock_upstream
+  upstream="$ASKED_UPSTREAM"
   upsert_rule_source "$group" "$url" "$upstream"
   ok "已添加 / 更新自定义规则源：$group"
 }
@@ -851,8 +920,8 @@ manage_rule_sources_menu() {
     echo
     list_rule_sources
     echo
-    echo "1. 添加内置在线规则链接"
-    echo "2. 添加自定义在线规则链接"
+    echo "1. 选择内置规则分组（自动 URL）"
+    echo "2. 添加自定义分组（可自动推导 URL）"
     echo "3. 删除规则分组"
     echo "4. 更新并转换在线规则"
     echo "0. 返回主菜单"
@@ -898,9 +967,11 @@ is_valid_domain() {
 
   [[ -n "$domain" ]] || return 1
 
-  # 去除常见前缀
+  # 去除常见前缀（仅处理 +. 和 *.）
   domain="${domain#+.}"
-  domain="${domain#*.}"
+  if [[ "$domain" == \*.* ]]; then
+    domain="${domain#*.}"
+  fi
 
   [[ -n "$domain" ]] || return 1
 
@@ -930,7 +1001,9 @@ clean_domain_value() {
 
   # 去掉通配和 +. 前缀
   domain="${domain#+.}"
-  domain="${domain#*.}"
+  if [[ "$domain" == \*.* ]]; then
+    domain="${domain#*.}"
+  fi
 
   echo "$domain"
 }
@@ -1147,7 +1220,7 @@ EOF
 
   cat > "${APP_DIR}/update-rules.sh" << EOF
 #!/usr/bin/env bash
-exec "$0" --update-rules
+exec "${MENU_SCRIPT_PATH}" --update-rules
 EOF
 
   chmod +x "${APP_DIR}/update-rules.sh"
@@ -1469,6 +1542,7 @@ uninstall_dnsproxy() {
   systemctl disable --now dnsproxy-rule-update.timer 2>/dev/null || true
 
   rm -f "$SERVICE_FILE" "$UPDATE_SERVICE_FILE" "$UPDATE_TIMER_FILE"
+  rm -f "$DNS_CMD_PATH" "$MENU_SCRIPT_PATH"
   systemctl daemon-reload
 
   read -rp "是否恢复 /etc/resolv.conf 备份？[Y/n]: " restore
@@ -1497,6 +1571,9 @@ uninstall_dnsproxy() {
 main_menu() {
   require_root
   create_default_config_if_missing
+
+  # 确保首次运行脚本后即可直接使用 `dns` 命令再次打开菜单
+  install_menu_command
 
   while true; do
     clear
