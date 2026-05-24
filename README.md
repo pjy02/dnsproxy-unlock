@@ -98,10 +98,12 @@ wget -O dnsproxy-unlock.sh https://raw.githubusercontent.com/pjy02/dnsproxy-unlo
 
 ## 快速说明
 
-运行脚本后会看到菜单：
+运行脚本后会看到菜单，主页会实时显示当前状态（安装 / 运行 / DNS模式）：
 
 ```txt
 AdGuard dnsproxy 在线规则 DNS 分流解锁脚本
+
+当前状态：安装=已安装 / 运行=运行中 / DNS模式=外部DNS(1.1.1.1)
 
 1. 安装 / 更新 dnsproxy
 2. 配置普通默认 DNS
