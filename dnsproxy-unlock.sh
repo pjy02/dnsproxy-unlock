@@ -1449,6 +1449,19 @@ get_system_dns_status() {
   fi
 }
 
+get_dns_resolution_mode() {
+  local ns
+  ns="$(get_system_dns_status)"
+
+  if [[ "$ns" == "127.0.0.1" ]]; then
+    echo "已接管(走本机dnsproxy)"
+  elif [[ "$ns" == "未知" || "$ns" == "不存在" ]]; then
+    echo "未知"
+  else
+    echo "外部DNS(${ns})"
+  fi
+}
+
 show_status() {
   echo
   echo "================================================------------"
@@ -1458,6 +1471,7 @@ show_status() {
   echo "- dnsproxy 安装状态：$(get_dnsproxy_install_status)"
   echo "- dnsproxy 运行状态：$(get_dnsproxy_run_status)"
   echo "- 当前系统 DNS：$(get_system_dns_status)"
+  echo "- DNS 解析模式：$(get_dns_resolution_mode)"
   echo
 
   if [[ -x "$BIN_PATH" ]]; then
@@ -1681,7 +1695,7 @@ main_menu() {
     echo "- 普通 IPv4 DNS 例如 1.1.1.1 支持作为 dnsproxy 上游。"
     echo "- 但 1.1.1.1 是普通公共 DNS，不是解锁 DNS。"
     echo
-    echo "当前状态：安装=$(get_dnsproxy_install_status) / 运行=$(get_dnsproxy_run_status) / 系统DNS=$(get_system_dns_status)"
+    echo "当前状态：安装=$(get_dnsproxy_install_status) / 运行=$(get_dnsproxy_run_status) / DNS模式=$(get_dns_resolution_mode)"
     echo
     echo "菜单："
     echo "1. 安装 / 更新 dnsproxy"
