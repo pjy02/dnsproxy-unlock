@@ -10,7 +10,7 @@
 # - 用户自行输入解锁 DNS / DoH / DoT / DoQ / IPv4 DNS
 # - 支持 systemd 服务
 # - 支持 systemd timer 自动更新规则
-# - 支持测试解析、状态查看、系统 DNS 备份 / 恢复、卸载恢复
+# - 支持测试解析、状态查看、系统 DNS 管理、备份 / 恢复、卸载恢复
 # ============================================================
 
 set -Eeuo pipefail
@@ -649,7 +649,7 @@ install_or_update_dnsproxy() {
     ok "普通默认 DNS 已自动配置：$auto_default_upstreams"
   else
     warn "普通默认 DNS 自动配置失败，保留当前配置。"
-    warn "安装完成后可进入菜单 2 手动配置普通默认 DNS。"
+    warn "安装完成后可进入菜单 2「系统 DNS 管理」配置普通默认 DNS。"
   fi
 
   install_menu_command
@@ -1992,18 +1992,8 @@ ask_lock_resolv_conf() {
   lock_confirm="${lock_confirm:-N}"
 
   if [[ "$lock_confirm" =~ ^[Yy]$ ]]; then
-    if command -v chattr >/dev/null 2>&1; then
-      if chattr +i "$RESOLV_CONF" 2>/dev/null; then
-        ok "已锁定 /etc/resolv.conf"
-        warn "以后要修改 DNS，请先执行：chattr -i /etc/resolv.conf"
-      else
-        warn "锁定 /etc/resolv.conf 失败，可能是文件系统不支持 chattr +i。"
-        return 1
-      fi
-    else
-      warn "系统没有 chattr，无法锁定 /etc/resolv.conf。"
-      return 1
-    fi
+    set_resolv_conf_lock_state lock
+    return $?
   else
     ok "未锁定 /etc/resolv.conf"
   fi
@@ -2011,9 +2001,33 @@ ask_lock_resolv_conf() {
   return 0
 }
 
+get_resolv_conf_attr_target_path() {
+  # chattr / lsattr 对符号链接本身支持有限。
+  # 如果 /etc/resolv.conf 是符号链接，则返回其真实目标文件；否则返回 /etc/resolv.conf。
+  local target
+
+  if [[ -L "$RESOLV_CONF" ]]; then
+    target="$(readlink -f "$RESOLV_CONF" 2>/dev/null || true)"
+    if [[ -n "$target" ]]; then
+      printf '%s\n' "$target"
+      return 0
+    fi
+  fi
+
+  printf '%s\n' "$RESOLV_CONF"
+}
+
 get_resolv_conf_lock_status() {
-  if [[ ! -e "$RESOLV_CONF" ]]; then
+  local target attrs
+
+  if [[ ! -e "$RESOLV_CONF" && ! -L "$RESOLV_CONF" ]]; then
     echo "不存在"
+    return 0
+  fi
+
+  target="$(get_resolv_conf_attr_target_path)"
+  if [[ ! -e "$target" ]]; then
+    echo "未知（符号链接目标不存在）"
     return 0
   fi
 
@@ -2022,13 +2036,96 @@ get_resolv_conf_lock_status() {
     return 0
   fi
 
-  local attrs
-  attrs="$(lsattr "$RESOLV_CONF" 2>/dev/null | awk '{print $1}' || true)"
+  attrs="$(lsattr "$target" 2>/dev/null | awk '{print $1}' || true)"
 
   if [[ "$attrs" == *i* ]]; then
-    echo "已锁定"
+    if [[ "$target" != "$RESOLV_CONF" ]]; then
+      echo "已锁定（目标文件）"
+    else
+      echo "已锁定"
+    fi
   else
-    echo "未锁定"
+    if [[ "$target" != "$RESOLV_CONF" ]]; then
+      echo "未锁定（目标文件）"
+    else
+      echo "未锁定"
+    fi
+  fi
+}
+
+set_resolv_conf_lock_state() {
+  local state="$1" target
+
+  if ! command -v chattr >/dev/null 2>&1; then
+    warn "系统没有 chattr，无法修改 /etc/resolv.conf 锁定状态。"
+    return 1
+  fi
+
+  if [[ ! -e "$RESOLV_CONF" && ! -L "$RESOLV_CONF" ]]; then
+    warn "$RESOLV_CONF 不存在，无法修改锁定状态。"
+    return 1
+  fi
+
+  target="$(get_resolv_conf_attr_target_path)"
+  if [[ ! -e "$target" ]]; then
+    warn "$RESOLV_CONF 是失效符号链接，目标不存在，无法修改锁定状态。"
+    warn "当前链接目标：$(readlink "$RESOLV_CONF" 2>/dev/null || true)"
+    return 1
+  fi
+
+  if [[ "$target" != "$RESOLV_CONF" ]]; then
+    warn "检测到 $RESOLV_CONF 是符号链接，将修改真实目标文件锁定状态：$target"
+  fi
+
+  case "$state" in
+    lock)
+      if chattr +i "$target" 2>/dev/null; then
+        ok "已锁定：$target"
+        warn "以后要修改系统 DNS，请先在 系统 DNS 管理 中执行：解锁 /etc/resolv.conf"
+        return 0
+      fi
+      warn "锁定失败，可能是文件系统不支持 chattr +i。"
+      return 1
+      ;;
+    unlock)
+      if chattr -i "$target" 2>/dev/null; then
+        ok "已解锁：$target"
+        return 0
+      fi
+      warn "解锁失败，可能是文件系统不支持 chattr -i。"
+      return 1
+      ;;
+    *)
+      err "未知锁定操作：$state"
+      return 1
+      ;;
+  esac
+}
+
+lock_resolv_conf_manual() {
+  require_root
+  echo
+  warn "锁定后，系统网络服务、DHCP、systemd-resolved、NetworkManager 可能无法覆盖 DNS。"
+  read -rp "确认锁定 /etc/resolv.conf？[y/N]: " confirm
+  confirm="${confirm:-N}"
+
+  if [[ "$confirm" =~ ^[Yy]$ ]]; then
+    set_resolv_conf_lock_state lock
+  else
+    warn "已取消锁定。"
+  fi
+}
+
+unlock_resolv_conf_manual() {
+  require_root
+  echo
+  read -rp "确认解锁 /etc/resolv.conf？[Y/n]: " confirm
+  confirm="${confirm:-Y}"
+
+  if [[ "$confirm" =~ ^[Yy]$ ]]; then
+    set_resolv_conf_lock_state unlock
+  else
+    warn "已取消解锁。"
   fi
 }
 
@@ -2132,7 +2229,7 @@ EOF
 backup_resolv_conf_once() {
   if [[ -f "$RESOLV_BACKUP" ]]; then
     warn "默认备份已存在：$RESOLV_BACKUP"
-    warn "如需重新备份，请进入：系统 DNS 备份 / 恢复管理 -> 创建新的系统 DNS 备份。"
+    warn "如需重新备份，请进入：系统 DNS 管理 -> 创建新的系统 DNS 备份。"
     return 0
   fi
 
@@ -2252,6 +2349,41 @@ restore_resolv_conf_from_backup() {
   restore_resolv_conf_backup_pair "$RESOLV_BACKUP" "$RESOLV_LINK_BACKUP"
 }
 
+build_fallback_resolv_conf_content() {
+  local -a nameservers=()
+  local has_v4="否"
+  local has_v6="否"
+
+  # 与“配置普通默认 DNS”的自动检测逻辑保持一致：
+  # - 检测到 IPv4：写入 Cloudflare + Google IPv4
+  # - 检测到 IPv6：额外写入 Cloudflare + Google IPv6
+  # resolv.conf 只能写 IP，不能写端口，所以这里不带 :53，也不使用 [IPv6] 格式。
+  if has_ipv4_network; then
+    has_v4="是"
+    nameservers+=("1.1.1.1" "8.8.8.8")
+  fi
+
+  if has_ipv6_network; then
+    has_v6="是"
+    nameservers+=("2606:4700:4700::1111" "2001:4860:4860::8888")
+  fi
+
+  info "临时公共 DNS 检测结果：IPv4=${has_v4}，IPv6=${has_v6}" >&2
+
+  # 极简系统或网络异常时，ip route 可能检测失败。
+  # 为了避免恢复/卸载后完全没有 DNS，至少写入 IPv4 公共 DNS。
+  if (( ${#nameservers[@]} == 0 )); then
+    warn "未检测到可用 IPv4 / IPv6 网络，仍写入 IPv4 公共 DNS 作为兜底。" >&2
+    nameservers+=("1.1.1.1" "8.8.8.8")
+  fi
+
+  local ns
+  for ns in "${nameservers[@]}"; do
+    printf 'nameserver %s
+' "$ns"
+  done
+}
+
 write_fallback_resolv_conf() {
   if command -v chattr >/dev/null 2>&1; then
     chattr -i "$RESOLV_CONF" 2>/dev/null || true
@@ -2261,16 +2393,18 @@ write_fallback_resolv_conf() {
     return 1
   fi
 
-  cat > "$RESOLV_WRITE_PATH" << 'EOF'
-nameserver 1.1.1.1
-nameserver 8.8.8.8
-EOF
+  build_fallback_resolv_conf_content > "$RESOLV_WRITE_PATH"
+
+  local dns_summary
+  dns_summary="$(awk '/^nameserver[[:space:]]+/ { if (n++) printf " / "; printf "%s", $2 } END { print "" }' "$RESOLV_WRITE_PATH")"
 
   if [[ "$RESOLV_WRITE_PATH" != "$RESOLV_CONF" ]]; then
     ok "已写入临时公共 DNS 到符号链接目标：$RESOLV_WRITE_PATH"
   else
-    ok "已写入临时公共 DNS：1.1.1.1 / 8.8.8.8"
+    ok "已写入临时公共 DNS"
   fi
+
+  ok "当前临时公共 DNS：$dns_summary"
 }
 
 show_current_resolv_conf_info() {
@@ -2457,22 +2591,31 @@ restore_resolv_conf_from_selected_backup() {
   restore_resolv_conf_backup_pair "${backup_files[$((choice - 1))]}" "${link_files[$((choice - 1))]}"
 }
 
-manage_system_dns_backup_menu() {
+manage_system_dns_menu() {
   require_root
 
   while true; do
     clear
     echo "============================================================"
-    echo " 系统 DNS 备份 / 恢复管理"
+    echo " 系统 DNS 管理"
     echo "============================================================"
+    load_config
     show_current_resolv_conf_info
     show_resolv_backup_status
     echo
-    echo "1. 创建新的系统 DNS 备份"
-    echo "2. 查看所有系统 DNS 备份"
-    echo "3. 恢复默认系统 DNS 备份"
-    echo "4. 选择历史备份恢复"
-    echo "5. 写入临时公共 DNS（1.1.1.1 / 8.8.8.8）"
+    echo "普通默认 DNS：${DEFAULT_UPSTREAMS:-未配置}"
+    echo "dnsproxy 监听：${LISTEN_ADDR:-127.0.0.1}:${LISTEN_PORT:-53}"
+    echo
+    echo "请选择："
+    echo "1. 配置普通默认 DNS（未命中分流规则时使用）"
+    echo "2. 应用系统 DNS 到 dnsproxy（写入 /etc/resolv.conf）"
+    echo "3. 创建新的系统 DNS 备份"
+    echo "4. 查看所有系统 DNS 备份"
+    echo "5. 恢复默认系统 DNS 备份"
+    echo "6. 选择历史备份恢复"
+    echo "7. 写入临时公共 DNS（自动检测 IPv4 / IPv6）"
+    echo "8. 锁定 /etc/resolv.conf 防止被覆盖"
+    echo "9. 解锁 /etc/resolv.conf"
     echo "0. 返回主菜单"
     echo
 
@@ -2480,14 +2623,20 @@ manage_system_dns_backup_menu() {
 
     case "$choice" in
       1)
+        configure_default_dns
+        ;;
+      2)
+        apply_system_dns
+        ;;
+      3)
         create_resolv_conf_backup "manual"
         pause
         ;;
-      2)
+      4)
         list_resolv_conf_backups
         pause
         ;;
-      3)
+      5)
         if [[ -f "$RESOLV_BACKUP" ]]; then
           warn "即将恢复默认备份：$RESOLV_BACKUP"
           read -rp "确认恢复？[y/N]: " confirm
@@ -2502,12 +2651,12 @@ manage_system_dns_backup_menu() {
         fi
         pause
         ;;
-      4)
+      6)
         restore_resolv_conf_from_selected_backup
         pause
         ;;
-      5)
-        warn "这会把系统 DNS 临时写为 1.1.1.1 / 8.8.8.8。"
+      7)
+        warn "这会根据机器 IPv4 / IPv6 网络情况写入临时公共 DNS。"
         read -rp "确认写入？[y/N]: " confirm
         confirm="${confirm:-N}"
         if [[ "$confirm" =~ ^[Yy]$ ]]; then
@@ -2515,6 +2664,14 @@ manage_system_dns_backup_menu() {
         else
           warn "已取消。"
         fi
+        pause
+        ;;
+      8)
+        lock_resolv_conf_manual
+        pause
+        ;;
+      9)
+        unlock_resolv_conf_manual
         pause
         ;;
       0)
@@ -2526,6 +2683,11 @@ manage_system_dns_backup_menu() {
         ;;
     esac
   done
+}
+
+# 兼容旧函数名：旧菜单项已合并进“系统 DNS 管理”。
+manage_system_dns_backup_menu() {
+  manage_system_dns_menu
 }
 
 restore_system_dns() {
@@ -3092,23 +3254,22 @@ main_menu() {
     echo
     menu_cyan_fixed_right "╔══ 安装与配置 ════════════════════════════════════════" "╗"
     menu_cyan_line 0 "  ${GREEN} 1)${NC} 安装 / 更新 dnsproxy"
-    menu_cyan_line 0 "  ${GREEN} 2)${NC} 配置普通默认 DNS"
+    menu_cyan_line 0 "  ${GREEN} 2)${NC} 系统 DNS 管理"
     menu_cyan_line 0 "  ${GREEN} 3)${NC} 在线规则分组管理"
     menu_cyan_line 0 "  ${GREEN} 4)${NC} 一键应用（更新规则 + dnsproxy 接管系统 DNS）"
     menu_cyan_fixed_right "╠══ 服务控制 ══════════════════════════════════════════" "╣"
     menu_cyan_line 0 "  ${GREEN} 5)${NC} 启动 / 重启 dnsproxy"
     menu_cyan_line 0 "  ${GREEN} 6)${NC} 停止 dnsproxy"
-    menu_cyan_line 0 "  ${GREEN} 7)${NC} 系统 DNS 备份 / 恢复管理"
     menu_cyan_fixed_right "╠══ 查看与调试 ════════════════════════════════════════" "╣"
-    menu_cyan_line 0 "  ${GREEN} 8)${NC} 测试域名解析"
-    menu_cyan_line 0 "  ${GREEN} 9)${NC} 查看状态"
-    menu_cyan_line 0 "  ${GREEN}10)${NC} 查看日志"
-    menu_cyan_line 0 "  ${GREEN}11)${NC} 预览生成的 upstream 规则"
-    menu_cyan_line 0 "  ${GREEN}12)${NC} 查看被忽略的规则"
+    menu_cyan_line 0 "  ${GREEN} 7)${NC} 测试域名解析"
+    menu_cyan_line 0 "  ${GREEN} 8)${NC} 查看状态"
+    menu_cyan_line 0 "  ${GREEN} 9)${NC} 查看日志"
+    menu_cyan_line 0 "  ${GREEN}10)${NC} 预览生成的 upstream 规则"
+    menu_cyan_line 0 "  ${GREEN}11)${NC} 查看被忽略的规则"
     menu_cyan_fixed_right "╠══ 高级功能 ══════════════════════════════════════════" "╣"
-    menu_cyan_line 0 "  ${GREEN}13)${NC} 启用规则自动更新（systemd timer）"
-    menu_cyan_line 0 "  ${GREEN}14)${NC} 禁用规则自动更新"
-    menu_cyan_line 0 "  ${RED}15)${NC} 卸载 dnsproxy"
+    menu_cyan_line 0 "  ${GREEN}12)${NC} 启用规则自动更新（systemd timer）"
+    menu_cyan_line 0 "  ${GREEN}13)${NC} 禁用规则自动更新"
+    menu_cyan_line 0 "  ${RED}14)${NC} 卸载 dnsproxy"
     menu_cyan_fixed_right "╠══════════════════════════════════════════════════════" "╣"
     menu_cyan_line 0 "  ${YELLOW} 0)${NC} 退出"
     menu_cyan_fixed_right "╚══════════════════════════════════════════════════════" "╝"
@@ -3122,7 +3283,7 @@ main_menu() {
         pause
         ;;
       2)
-        configure_default_dns
+        manage_system_dns_menu
         ;;
       3)
         manage_rule_sources_menu
@@ -3137,31 +3298,28 @@ main_menu() {
         stop_dnsproxy
         ;;
       7)
-        manage_system_dns_backup_menu
-        ;;
-      8)
         test_dns
         ;;
-      9)
+      8)
         show_status
         ;;
-      10)
+      9)
         show_logs
         pause
         ;;
-      11)
+      10)
         preview_upstream_rules
         ;;
-      12)
+      11)
         preview_ignored_rules
         ;;
-      13)
+      12)
         install_update_timer
         ;;
-      14)
+      13)
         disable_update_timer
         ;;
-      15)
+      14)
         uninstall_dnsproxy
         ;;
       0)
