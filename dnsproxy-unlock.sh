@@ -10,7 +10,7 @@
 # - 用户自行输入解锁 DNS / DoH / DoT / DoQ / IPv4 DNS
 # - 支持 systemd 服务
 # - 支持 systemd timer 自动更新规则
-# - 支持测试解析、状态查看、卸载恢复
+# - 支持测试解析、状态查看、系统 DNS 备份 / 恢复、卸载恢复
 # ============================================================
 
 set -Eeuo pipefail
@@ -32,6 +32,8 @@ UPDATE_TIMER_FILE="/etc/systemd/system/dnsproxy-rule-update.timer"
 
 RESOLV_CONF="/etc/resolv.conf"
 RESOLV_BACKUP="/etc/resolv.conf.bak.dnsproxy"
+RESOLV_LINK_BACKUP="/etc/resolv.conf.bak.dnsproxy.link"
+RESOLV_BACKUP_DIR="/etc/dnsproxy-resolv-backups"
 
 DNSPROXY_FALLBACK_VERSION="v0.79.0"
 MENU_SCRIPT_PATH="${APP_DIR}/dnsproxy-unlock.sh"
@@ -63,7 +65,7 @@ BUILTIN_RULE_NAMES=(
 BUILTIN_RULE_BASE_URL="https://raw.githubusercontent.com/blackmatrix7/ios_rule_script/refs/heads/master/rule/Clash"
 
 
-# AKile DNS 解锁上游候选。测速逻辑参考 AKDNS 脚本：使用 dig 对同一测试域名多次查询，取平均响应时间。
+# AKile DNS 候选上游。这里只做延迟测速：使用 dig 对同一测试域名多次查询，取平均响应时间；不代表一定解锁成功。
 AKILE_DNS_LIST=(
   "66.66.66.66"
   "45.207.157.146"
@@ -75,7 +77,7 @@ AKILE_DNS_LIST=(
   "166.0.199.207"
 )
 
-# GaiDNS DoH 解锁上游候选。
+# GaiDNS DoH 候选上游。这里只做连接延迟测速；不代表一定解锁成功。
 GAIDNS_DOH_LIST=(
   "https://hk.gaidns.top/doh"
   "https://sg.gaidns.top/doh"
@@ -114,6 +116,21 @@ pause() {
 require_root() {
   if [[ "${EUID}" -ne 0 ]]; then
     err "请使用 root 权限运行：sudo $0"
+    exit 1
+  fi
+}
+
+require_systemd() {
+  if ! command -v systemctl >/dev/null 2>&1; then
+    err "当前系统没有 systemctl，本脚本依赖 systemd 管理 dnsproxy 服务和自动更新 timer。"
+    err "暂不支持 OpenRC / SysVinit / 无 systemd 的容器环境。"
+    exit 1
+  fi
+
+  if [[ ! -d /run/systemd/system ]]; then
+    err "当前环境未检测到正在运行的 systemd：/run/systemd/system 不存在。"
+    err "本脚本需要 systemd 管理服务、开机启动和规则自动更新 timer。"
+    err "请在支持 systemd 的 VPS / 服务器上运行，或先启用 systemd 后再执行。"
     exit 1
   fi
 }
@@ -161,35 +178,36 @@ install_dependencies() {
   local pm
   pm="$(detect_pkg_manager)"
 
-  if command -v curl >/dev/null 2>&1 && \
-     command -v dig  >/dev/null 2>&1 && \
-     command -v ss   >/dev/null 2>&1 && \
-     command -v awk  >/dev/null 2>&1; then
+  if command -v curl  >/dev/null 2>&1 && \
+     command -v dig   >/dev/null 2>&1 && \
+     command -v ss    >/dev/null 2>&1 && \
+     command -v awk   >/dev/null 2>&1 && \
+     command -v flock >/dev/null 2>&1; then
     ok "依赖已满足，跳过安装"
     return 0
   fi
 
-  info "检查并安装依赖：curl tar gzip grep sed awk sort ss dig"
+  info "检查并安装依赖：curl tar gzip grep sed awk sort ss dig flock"
 
   case "$pm" in
     apt)
       apt-get update -q
-      apt-get install -y curl tar gzip grep sed gawk coreutils iproute2 dnsutils ca-certificates
+      apt-get install -y curl tar gzip grep sed gawk coreutils iproute2 dnsutils util-linux ca-certificates
       ;;
     dnf)
-      dnf install -y curl tar gzip grep sed gawk coreutils iproute bind-utils ca-certificates
+      dnf install -y curl tar gzip grep sed gawk coreutils iproute bind-utils util-linux ca-certificates
       ;;
     yum)
-      yum install -y curl tar gzip grep sed gawk coreutils iproute bind-utils ca-certificates
+      yum install -y curl tar gzip grep sed gawk coreutils iproute bind-utils util-linux ca-certificates
       ;;
     apk)
-      apk add --no-cache curl tar gzip grep sed gawk coreutils iproute2 bind-tools ca-certificates
+      apk add --no-cache curl tar gzip grep sed gawk coreutils iproute2 bind-tools util-linux ca-certificates
       ;;
     pacman)
-      pacman -Sy --noconfirm curl tar gzip grep sed gawk coreutils iproute2 bind ca-certificates
+      pacman -Sy --noconfirm curl tar gzip grep sed gawk coreutils iproute2 bind util-linux ca-certificates
       ;;
     *)
-      warn "无法识别包管理器，请自行确保已安装 curl、tar、ss、dig。"
+      warn "无法识别包管理器，请自行确保已安装 curl、tar、ss、dig、flock。"
       ;;
   esac
 
@@ -281,17 +299,25 @@ load_config() {
 }
 
 # FIX: 改用删除旧行+追加新行，避免 sed 的 | 分隔符与值内容冲突
+# FIX: 写入 config.env 时使用 Bash 安全转义，避免 source 配置文件时被特殊字符破坏或执行。
 save_config_value() {
   local key="$1"
   local value="$2"
+  local quoted_value
 
   create_default_config_if_missing
 
-  # 删除已有的同名 key 行（key 只含大写字母和下划线，模式安全）
+  if [[ ! "$key" =~ ^[A-Z_][A-Z0-9_]*$ ]]; then
+    err "配置键名非法：$key"
+    return 1
+  fi
+
+  # 删除已有的同名 key 行（key 只允许大写字母、数字和下划线，模式安全）
   sed -i "/^${key}=/d" "$CONFIG_FILE"
 
-  # 追加新值（printf 不会解释特殊字符）
-  printf '%s="%s"\n' "$key" "$value" >> "$CONFIG_FILE"
+  # 使用 Bash 的 %q 生成可被 source 安全读取的字面量。
+  printf -v quoted_value '%q' "$value"
+  printf '%s=%s\n' "$key" "$quoted_value" >> "$CONFIG_FILE"
 }
 
 # ============================================================
@@ -335,21 +361,131 @@ is_valid_ipv4() {
   return 0
 }
 
+is_valid_port() {
+  local port="$1"
+  [[ "$port" =~ ^[0-9]{1,5}$ ]] || return 1
+  (( port >= 1 && port <= 65535 )) || return 1
+  return 0
+}
+
+is_valid_hostname() {
+  local host="$1"
+  local label
+  local IFS='.'
+  local -a labels
+
+  [[ -n "$host" ]] || return 1
+  [[ "$host" == "localhost" ]] && return 0
+  [[ "$host" =~ ^[A-Za-z0-9.-]+$ ]] || return 1
+  [[ "$host" != .* && "$host" != *. && "$host" != *..* ]] || return 1
+
+  read -r -a labels <<< "$host"
+  (( ${#labels[@]} >= 2 )) || return 1
+
+  for label in "${labels[@]}"; do
+    [[ -n "$label" ]] || return 1
+    (( ${#label} <= 63 )) || return 1
+    [[ "$label" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$ ]] || return 1
+  done
+
+  return 0
+}
+
+validate_host_port() {
+  local hostport="$1"
+  local host port
+
+  [[ -n "$hostport" ]] || return 1
+  [[ "$hostport" != */* ]] || return 1
+  [[ "$hostport" != *@* ]] || return 1
+
+  # [IPv6] 或 [IPv6]:port
+  if [[ "$hostport" =~ ^\[([0-9A-Fa-f:]+)\](:([0-9]{1,5}))?$ ]]; then
+    [[ "${BASH_REMATCH[1]}" == *:* ]] || return 1
+    if [[ -n "${BASH_REMATCH[3]:-}" ]]; then
+      is_valid_port "${BASH_REMATCH[3]}" || return 1
+    fi
+    return 0
+  fi
+
+  # 未加 [] 的 IPv6 不允许带协议使用，避免和端口分隔符混淆。
+  if [[ "$hostport" == *:*:* ]]; then
+    return 1
+  fi
+
+  if [[ "$hostport" == *:* ]]; then
+    host="${hostport%%:*}"
+    port="${hostport##*:}"
+    is_valid_port "$port" || return 1
+  else
+    host="$hostport"
+  fi
+
+  if [[ "$host" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+    is_valid_ipv4 "$host"
+    return $?
+  fi
+
+  is_valid_hostname "$host"
+}
+
+validate_url_upstream() {
+  local upstream="$1"
+  local scheme rest hostport
+
+  [[ "$upstream" =~ ^(https|tls|quic|sdns|tcp|udp|h3)://(.+)$ ]] || return 1
+  scheme="${BASH_REMATCH[1]}"
+  rest="${BASH_REMATCH[2]}"
+
+  [[ -n "$rest" ]] || return 1
+
+  # 拒绝空白、引号、反引号和常见 shell 元字符，避免写入 config.env 后造成歧义。
+  # 注意：http:// 不再视为合法 DoH，上游 URL 建议使用 https://。
+  [[ "$rest" != *[[:space:]]* ]] || return 1
+  [[ "$rest" != *\"* ]] || return 1
+  [[ "$rest" != *\'* ]] || return 1
+  [[ "$rest" != *\`* ]] || return 1
+  [[ "$rest" != *\$* ]] || return 1
+  [[ "$rest" != *\;* ]] || return 1
+  [[ "$rest" != *\|* ]] || return 1
+  [[ "$rest" != *\&* ]] || return 1
+  [[ "$rest" != *\<* ]] || return 1
+  [[ "$rest" != *\>* ]] || return 1
+
+  case "$scheme" in
+    sdns)
+      # DNS stamp。保持相对宽松，但仍限制为常见 URL-safe 字符。
+      [[ "$rest" =~ ^[A-Za-z0-9._~+=/-]+$ ]] || return 1
+      return 0
+      ;;
+    https|h3)
+      # DoH / HTTP3 DoH：允许 path / query，但 host 部分必须合法。
+      hostport="${rest%%/*}"
+      validate_host_port "$hostport"
+      return $?
+      ;;
+    tls|quic|tcp|udp)
+      # DoT / DoQ / TCP / UDP：只接受 host[:port] 或 [IPv6][:port]。
+      validate_host_port "$rest"
+      return $?
+      ;;
+  esac
+
+  return 1
+}
+
 validate_upstream() {
   local upstream
   upstream="$(trim "$1")"
 
   [[ -n "$upstream" ]] || return 1
 
-  # DoH / DoT / DoQ / DNSCrypt / TCP / UDP / HTTP3
-  if [[ "$upstream" =~ ^https:// ]]; then return 0; fi
-  if [[ "$upstream" =~ ^http:// ]]; then return 0; fi
-  if [[ "$upstream" =~ ^tls:// ]]; then return 0; fi
-  if [[ "$upstream" =~ ^quic:// ]]; then return 0; fi
-  if [[ "$upstream" =~ ^sdns:// ]]; then return 0; fi
-  if [[ "$upstream" =~ ^tcp:// ]]; then return 0; fi
-  if [[ "$upstream" =~ ^udp:// ]]; then return 0; fi
-  if [[ "$upstream" =~ ^h3:// ]]; then return 0; fi
+  # 带协议的上游：DoH / DoT / DoQ / DNSCrypt stamp / TCP / UDP / HTTP3 DoH。
+  # 不接受 http://，DoH 请使用 https://。
+  if [[ "$upstream" == *"://"* ]]; then
+    validate_url_upstream "$upstream"
+    return $?
+  fi
 
   # IPv4
   if [[ "$upstream" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
@@ -362,7 +498,7 @@ validate_upstream() {
     local ip="${BASH_REMATCH[1]}"
     local port="${BASH_REMATCH[3]}"
     is_valid_ipv4 "$ip" || return 1
-    (( port >= 1 && port <= 65535 )) || return 1
+    is_valid_port "$port" || return 1
     return 0
   fi
 
@@ -370,7 +506,7 @@ validate_upstream() {
   if [[ "$upstream" =~ ^\[([0-9A-Fa-f:]+)\]:([0-9]{1,5})$ ]]; then
     local port="${BASH_REMATCH[2]}"
     [[ "${BASH_REMATCH[1]}" == *:* ]] || return 1
-    (( port >= 1 && port <= 65535 )) || return 1
+    is_valid_port "$port" || return 1
     return 0
   fi
 
@@ -379,12 +515,17 @@ validate_upstream() {
     return 0
   fi
 
-  # 域名:端口 或 域名
-  if [[ "$upstream" =~ ^[A-Za-z0-9.-]+(:[0-9]{1,5})?$ ]]; then
+  # 域名:端口
+  if [[ "$upstream" == *:* ]]; then
+    local host="${upstream%%:*}"
+    local port="${upstream##*:}"
+    is_valid_hostname "$host" || return 1
+    is_valid_port "$port" || return 1
     return 0
   fi
 
-  return 1
+  # 纯域名
+  is_valid_hostname "$upstream"
 }
 
 ASKED_UPSTREAM=""
@@ -523,7 +664,10 @@ install_or_update_dnsproxy() {
   start_now="${start_now:-Y}"
 
   if [[ "$start_now" =~ ^[Yy]$ ]]; then
-    handle_port_conflict
+    if ! handle_port_conflict; then
+      warn "已取消启动 dnsproxy。"
+      return 0
+    fi
     systemctl daemon-reload
     systemctl enable dnsproxy
     systemctl restart dnsproxy
@@ -1128,7 +1272,7 @@ run_ipv4_dns_latency_test() {
   echo "测试域名：$domain"
   echo "测试次数：${count} 次 / DNS，超时：${timeout}s"
   echo "------------------------------------------------------------"
-  info "正在测速，请稍候..."
+  info "正在进行延迟测速，请稍候..."
 
   for dns in "${dns_list[@]}"; do
     safe="${dns//./_}"
@@ -1178,7 +1322,7 @@ run_ipv4_dns_latency_test() {
 
   if [[ -z "$best_dns" || -z "$best_avg" || "$best_avg" -ge 1000 ]]; then
     rm -rf "$tmpdir"
-    err "所有 AKile DNS 测速均超时，未能选出可用 DNS。"
+    err "所有 AKile DNS 延迟测速均超时，未能选出候选 DNS。"
     return 1
   fi
 
@@ -1186,7 +1330,7 @@ run_ipv4_dns_latency_test() {
   ok "最低延迟 AKile DNS：${ASKED_UPSTREAM}（${best_avg}ms）"
 
   echo
-  read -rp "确认使用最低延迟 AKile DNS？[Y/n]: " confirm
+  read -rp "确认使用当前最低延迟的 AKile DNS？[Y/n]: " confirm
   confirm="${confirm:-Y}"
   if [[ "$confirm" =~ ^[Yy]$ ]]; then
     rm -rf "$tmpdir"
@@ -1262,7 +1406,7 @@ run_https_latency_test() {
   best_url="$(printf '%s' "$result" | sort -n | head -n 1 | cut -d' ' -f2-)"
 
   if [[ -z "$best_url" || -z "$best_ms" || "$best_ms" -ge 5000 ]]; then
-    err "GaiDNS DoH 测速失败，未能选出可用上游。"
+    err "GaiDNS DoH 连接延迟测速失败，未能选出候选上游。"
     return 1
   fi
 
@@ -1280,7 +1424,7 @@ select_gaidns_upstream() {
   echo "1. 香港：${GAIDNS_DOH_LIST[0]}"
   echo "2. 新加坡：${GAIDNS_DOH_LIST[1]}"
   echo "3. 美国：${GAIDNS_DOH_LIST[2]}"
-  echo "4. 自动测速选择最低连接延迟"
+  echo "4. 自动延迟测速选择最低连接延迟"
   echo "0. 返回"
   echo
   read -rp "请输入选项: " choice
@@ -1461,7 +1605,7 @@ manage_rule_sources_menu() {
     list_rule_sources
     echo
     echo "1. 选择内置规则分组（手动输入解锁上游）"
-    echo "2. 使用 AKile DNS 智能测速添加内置分组"
+    echo "2. 使用 AKile DNS 延迟测速添加内置分组"
     echo "3. 使用 GaiDNS DoH 添加内置分组"
     echo "4. 添加自定义分组（可自动推导 URL）"
     echo "5. 删除规则分组"
@@ -1591,7 +1735,18 @@ convert_rule_line() {
   value="$(clean_domain_value "$value")"
 
   case "$type" in
-    DOMAIN|DOMAIN-SUFFIX)
+    DOMAIN)
+      # Clash 的 DOMAIN 是精确域名规则；dnsproxy 的 [/$value/] 规则通常会同时覆盖该域名和子域名。
+      # dnsproxy upstream 文件没有完全等价的 Clash DOMAIN 精确匹配表达，所以这里保留原转换方式，并在生成文件头部写明语义差异。
+      if is_valid_domain "$value"; then
+        echo "[/${value}/]${upstream}" >> "$TMP_FILE"
+      else
+        echo "[$group] invalid domain: $line" >> "$IGNORED_LOG"
+      fi
+      ;;
+
+    DOMAIN-SUFFIX)
+      # Clash 的 DOMAIN-SUFFIX 与 dnsproxy [/$value/] 的使用目的更接近：让该域名及其子域名走指定上游。
       if is_valid_domain "$value"; then
         echo "[/${value}/]${upstream}" >> "$TMP_FILE"
       else
@@ -1604,9 +1759,8 @@ convert_rule_line() {
       ;;
 
     DOMAIN-WILDCARD)
-      # dnsproxy 没有 Clash 这种通配表达方式。
-      # 简单的 *.example.com 已经在 clean_domain_value 里能变成 example.com。
-      # 但复杂 wildcard 容易误伤，所以默认忽略。
+      # dnsproxy 没有 Clash DOMAIN-WILDCARD 的完全等价表达。
+      # 为避免复杂 wildcard 误伤，默认忽略；如需支持 *.example.com，建议改用 DOMAIN-SUFFIX,example.com。
       echo "[$group] ignored DOMAIN-WILDCARD: $line" >> "$IGNORED_LOG"
       ;;
 
@@ -1672,12 +1826,17 @@ update_online_rules() {
   ensure_dir
   create_default_config_if_missing
 
+  if ! command -v flock >/dev/null 2>&1; then
+    err "缺少 flock 命令，无法安全更新规则。请安装 util-linux 后重试。"
+    return 1
+  fi
+
   # 并发锁：同一时间只允许一个更新进程运行
   exec 9>"$LOCK_FILE"
   if ! flock -n 9; then
     warn "另一个规则更新进程正在运行，请稍后再试。"
     exec 9>&-
-    return 0
+    return 1
   fi
 
   : > "$TMP_FILE"
@@ -1688,6 +1847,10 @@ update_online_rules() {
     echo "# dnsproxy upstream rules"
     echo "# Auto generated at: $(date '+%F %T')"
     echo "# Source file: $SOURCE_FILE"
+    echo "# Note:"
+    echo "# - Clash DOMAIN and DOMAIN-SUFFIX are both converted to dnsproxy [/<domain>/]<upstream>."
+    echo "# - dnsproxy [/<domain>/] usually covers the domain and its subdomains."
+    echo "# - Therefore Clash DOMAIN exact-match semantics cannot be preserved perfectly."
     echo "# =================================================="
     echo
   } >> "$TMP_FILE"
@@ -1869,6 +2032,520 @@ get_resolv_conf_lock_status() {
   fi
 }
 
+ensure_resolv_backup_dir() {
+  mkdir -p "$RESOLV_BACKUP_DIR"
+}
+
+get_resolv_conf_link_target() {
+  if [[ -L "$RESOLV_CONF" ]]; then
+    readlink "$RESOLV_CONF" 2>/dev/null || true
+  fi
+}
+
+resolve_resolv_link_target_path() {
+  local link_target="${1:-}"
+
+  [[ -n "$link_target" ]] || return 1
+
+  if [[ "$link_target" == /* ]]; then
+    printf '%s\n' "$link_target"
+  else
+    printf '%s\n' "/etc/${link_target}"
+  fi
+}
+
+get_backup_first_nameserver() {
+  local file="$1"
+  awk '/^nameserver[[:space:]]+/ {print $2; exit}' "$file" 2>/dev/null || true
+}
+
+create_resolv_conf_backup() {
+  local reason="${1:-manual}"
+  local ts backup_file meta_file link_file link_target real_target first_ns
+
+  if [[ ! -e "$RESOLV_CONF" && ! -L "$RESOLV_CONF" ]]; then
+    err "$RESOLV_CONF 不存在，无法备份。"
+    return 1
+  fi
+
+  if [[ -L "$RESOLV_CONF" ]]; then
+    real_target="$(readlink -f "$RESOLV_CONF" 2>/dev/null || true)"
+    if [[ -z "$real_target" || ! -e "$real_target" ]]; then
+      err "$RESOLV_CONF 是失效符号链接，目标不存在，无法备份内容。"
+      warn "当前链接目标：$(readlink "$RESOLV_CONF" 2>/dev/null || true)"
+      return 1
+    fi
+  fi
+
+  ensure_resolv_backup_dir
+
+  ts="$(date '+%Y%m%d-%H%M%S')"
+  backup_file="${RESOLV_BACKUP_DIR}/resolv.conf.${ts}"
+  if [[ -e "$backup_file" ]]; then
+    backup_file="${RESOLV_BACKUP_DIR}/resolv.conf.${ts}.$$"
+  fi
+  meta_file="${backup_file}.meta"
+  link_file="${backup_file}.link"
+
+  if ! cp -aL "$RESOLV_CONF" "$backup_file"; then
+    err "备份失败：无法复制 $RESOLV_CONF"
+    return 1
+  fi
+
+  link_target="$(get_resolv_conf_link_target)"
+  real_target="$(readlink -f "$RESOLV_CONF" 2>/dev/null || true)"
+  first_ns="$(get_backup_first_nameserver "$backup_file")"
+
+  if [[ -n "$link_target" ]]; then
+    printf '%s\n' "$link_target" > "$link_file"
+  else
+    rm -f "$link_file"
+  fi
+
+  cat > "$meta_file" << EOF
+created_at=$(date '+%F %T')
+reason=${reason}
+source=${RESOLV_CONF}
+was_symlink=$([[ -n "$link_target" ]] && echo yes || echo no)
+link_target=${link_target}
+real_target=${real_target}
+first_nameserver=${first_ns}
+EOF
+
+  # 同步一份固定路径备份，兼容旧版恢复逻辑和卸载逻辑。
+  cp -a "$backup_file" "$RESOLV_BACKUP"
+  if [[ -n "$link_target" ]]; then
+    printf '%s\n' "$link_target" > "$RESOLV_LINK_BACKUP"
+  else
+    rm -f "$RESOLV_LINK_BACKUP"
+  fi
+
+  ok "已创建系统 DNS 备份：$backup_file"
+  ok "已更新默认备份：$RESOLV_BACKUP"
+  if [[ -n "$link_target" ]]; then
+    ok "已记录 /etc/resolv.conf 符号链接：$link_target"
+  fi
+
+  return 0
+}
+
+backup_resolv_conf_once() {
+  if [[ -f "$RESOLV_BACKUP" ]]; then
+    warn "默认备份已存在：$RESOLV_BACKUP"
+    warn "如需重新备份，请进入：系统 DNS 备份 / 恢复管理 -> 创建新的系统 DNS 备份。"
+    return 0
+  fi
+
+  create_resolv_conf_backup "auto-before-apply"
+}
+
+RESOLV_WRITE_PATH=""
+
+prepare_resolv_conf_write_path() {
+  local allow_replace_broken="${1:-no}"
+  local link_target abs_target
+
+  RESOLV_WRITE_PATH="$RESOLV_CONF"
+
+  if [[ -L "$RESOLV_CONF" ]]; then
+    link_target="$(readlink "$RESOLV_CONF" 2>/dev/null || true)"
+    abs_target="$(readlink -f "$RESOLV_CONF" 2>/dev/null || true)"
+
+    warn "检测到 $RESOLV_CONF 是符号链接：$link_target"
+
+    if [[ -z "$abs_target" ]]; then
+      err "$RESOLV_CONF 的符号链接目标不存在，已拒绝自动删除该链接。"
+      if [[ "$allow_replace_broken" == "yes" ]]; then
+        warn "为避免系统 DNS 失效，将替换这个失效链接为普通 resolv.conf 文件。"
+        rm -f "$RESOLV_CONF"
+        RESOLV_WRITE_PATH="$RESOLV_CONF"
+        return 0
+      fi
+      return 1
+    fi
+
+    warn "为避免误删 systemd-resolved / NetworkManager 管理的链接，将保留符号链接，只写入目标文件：$abs_target"
+
+    if [[ "$abs_target" == /run/systemd/resolve/* || "$link_target" == *systemd/resolve* ]]; then
+      warn "该 resolv.conf 疑似由 systemd-resolved 管理，后续可能被 systemd-resolved 覆盖。"
+      warn "如需稳定接管，建议先在端口冲突菜单中停止并禁用 systemd-resolved。"
+    fi
+
+    RESOLV_WRITE_PATH="$abs_target"
+  fi
+
+  return 0
+}
+
+write_dnsproxy_resolv_conf() {
+  local mode="${1:-safe}"
+
+  prepare_resolv_conf_write_path "no" || return 1
+
+  cat > "$RESOLV_WRITE_PATH" << EOF
+nameserver ${LISTEN_ADDR}
+options edns0 trust-ad
+EOF
+
+  if [[ "$RESOLV_WRITE_PATH" != "$RESOLV_CONF" ]]; then
+    ok "已写入 resolv.conf 符号链接目标：$RESOLV_WRITE_PATH"
+  else
+    ok "已写入 $RESOLV_CONF"
+  fi
+
+  ok "已应用系统 DNS 到 ${LISTEN_ADDR}"
+  return 0
+}
+
+restore_resolv_conf_backup_pair() {
+  local backup_file="$1"
+  local link_file="${2:-}"
+  local link_target target_path target_dir
+
+  if [[ ! -f "$backup_file" ]]; then
+    err "备份文件不存在：$backup_file"
+    return 1
+  fi
+
+  if command -v chattr >/dev/null 2>&1; then
+    chattr -i "$RESOLV_CONF" 2>/dev/null || true
+  fi
+
+  if [[ -n "$link_file" && -f "$link_file" ]]; then
+    link_target="$(cat "$link_file" 2>/dev/null || true)"
+  else
+    link_target=""
+  fi
+
+  if [[ -n "$link_target" ]]; then
+    target_path="$(resolve_resolv_link_target_path "$link_target" || true)"
+    target_dir="$(dirname "$target_path")"
+
+    if [[ -n "$target_path" && -d "$target_dir" ]]; then
+      if command -v chattr >/dev/null 2>&1; then
+        chattr -i "$target_path" 2>/dev/null || true
+      fi
+
+      if cp -a "$backup_file" "$target_path"; then
+        rm -f "$RESOLV_CONF"
+        ln -s "$link_target" "$RESOLV_CONF"
+        ok "已恢复 /etc/resolv.conf 符号链接：$link_target"
+        ok "已恢复备份内容到链接目标：$target_path"
+        return 0
+      else
+        warn "写入符号链接目标失败：$target_path"
+      fi
+    else
+      warn "原符号链接目标目录不存在：$target_dir"
+      warn "将恢复为普通 /etc/resolv.conf 文件。"
+    fi
+  fi
+
+  rm -f "$RESOLV_CONF"
+  cp -a "$backup_file" "$RESOLV_CONF"
+  ok "已恢复备份：$backup_file -> $RESOLV_CONF"
+  return 0
+}
+
+restore_resolv_conf_from_backup() {
+  [[ -f "$RESOLV_BACKUP" ]] || return 1
+  restore_resolv_conf_backup_pair "$RESOLV_BACKUP" "$RESOLV_LINK_BACKUP"
+}
+
+write_fallback_resolv_conf() {
+  if command -v chattr >/dev/null 2>&1; then
+    chattr -i "$RESOLV_CONF" 2>/dev/null || true
+  fi
+
+  if ! prepare_resolv_conf_write_path "yes"; then
+    return 1
+  fi
+
+  cat > "$RESOLV_WRITE_PATH" << 'EOF'
+nameserver 1.1.1.1
+nameserver 8.8.8.8
+EOF
+
+  if [[ "$RESOLV_WRITE_PATH" != "$RESOLV_CONF" ]]; then
+    ok "已写入临时公共 DNS 到符号链接目标：$RESOLV_WRITE_PATH"
+  else
+    ok "已写入临时公共 DNS：1.1.1.1 / 8.8.8.8"
+  fi
+}
+
+show_current_resolv_conf_info() {
+  echo
+  echo "当前 /etc/resolv.conf："
+  echo "------------------------------------------------------------"
+
+  if [[ -L "$RESOLV_CONF" ]]; then
+    echo "类型：符号链接"
+    echo "链接目标：$(readlink "$RESOLV_CONF" 2>/dev/null || true)"
+    echo "真实路径：$(readlink -f "$RESOLV_CONF" 2>/dev/null || echo '目标不存在')"
+  elif [[ -f "$RESOLV_CONF" ]]; then
+    echo "类型：普通文件"
+  elif [[ -e "$RESOLV_CONF" ]]; then
+    echo "类型：存在，但不是普通文件"
+  else
+    echo "类型：不存在"
+  fi
+
+  echo "锁定状态：$(get_resolv_conf_lock_status)"
+  echo "首个 nameserver：$(get_system_dns_status)"
+  echo
+  echo "内容预览："
+  if [[ -e "$RESOLV_CONF" || -L "$RESOLV_CONF" ]]; then
+    sed -n '1,12p' "$RESOLV_CONF" 2>/dev/null || true
+  else
+    echo "无"
+  fi
+  echo "------------------------------------------------------------"
+}
+
+show_resolv_backup_status() {
+  local history_count=0
+
+  if [[ -d "$RESOLV_BACKUP_DIR" ]]; then
+    history_count="$(find "$RESOLV_BACKUP_DIR" -maxdepth 1 -type f -name 'resolv.conf.*' ! -name '*.meta' ! -name '*.link' 2>/dev/null | wc -l | awk '{print $1}')"
+  fi
+
+  echo
+  echo "系统 DNS 备份状态："
+  echo "------------------------------------------------------------"
+  if [[ -f "$RESOLV_BACKUP" ]]; then
+    echo "默认备份：存在（$RESOLV_BACKUP）"
+    echo "默认备份首个 nameserver：$(get_backup_first_nameserver "$RESOLV_BACKUP")"
+  else
+    echo "默认备份：不存在"
+  fi
+
+  if [[ -f "$RESOLV_LINK_BACKUP" ]]; then
+    echo "默认符号链接记录：$(cat "$RESOLV_LINK_BACKUP" 2>/dev/null || true)"
+  else
+    echo "默认符号链接记录：无"
+  fi
+
+  echo "历史备份目录：$RESOLV_BACKUP_DIR"
+  echo "历史备份数量：$history_count"
+  echo "------------------------------------------------------------"
+}
+
+list_resolv_conf_backups() {
+  local n=0 file meta link ns created was_symlink link_target
+
+  echo
+  echo "可用系统 DNS 备份："
+  echo "------------------------------------------------------------"
+
+  if [[ -f "$RESOLV_BACKUP" ]]; then
+    n=$((n + 1))
+    ns="$(get_backup_first_nameserver "$RESOLV_BACKUP")"
+    echo "${n}. 默认备份"
+    echo "   文件：$RESOLV_BACKUP"
+    echo "   首个 nameserver：${ns:-未知}"
+    if [[ -f "$RESOLV_LINK_BACKUP" ]]; then
+      echo "   原类型：符号链接 -> $(cat "$RESOLV_LINK_BACKUP" 2>/dev/null || true)"
+    else
+      echo "   原类型：普通文件 / 未记录"
+    fi
+    echo
+  fi
+
+  if [[ -d "$RESOLV_BACKUP_DIR" ]]; then
+    while IFS= read -r file; do
+      [[ -f "$file" ]] || continue
+      n=$((n + 1))
+      meta="${file}.meta"
+      link="${file}.link"
+      ns="$(get_backup_first_nameserver "$file")"
+      created=""
+      was_symlink=""
+      link_target=""
+      if [[ -f "$meta" ]]; then
+        created="$(awk -F= '/^created_at=/ {print substr($0, index($0,$2)); exit}' "$meta" 2>/dev/null || true)"
+        was_symlink="$(awk -F= '/^was_symlink=/ {print $2; exit}' "$meta" 2>/dev/null || true)"
+        link_target="$(awk -F= '/^link_target=/ {print substr($0, index($0,$2)); exit}' "$meta" 2>/dev/null || true)"
+      fi
+      if [[ -z "$link_target" && -f "$link" ]]; then
+        link_target="$(cat "$link" 2>/dev/null || true)"
+      fi
+
+      echo "${n}. 历史备份：$(basename "$file")"
+      echo "   文件：$file"
+      echo "   时间：${created:-未知}"
+      echo "   首个 nameserver：${ns:-未知}"
+      if [[ "$was_symlink" == "yes" || -n "$link_target" ]]; then
+        echo "   原类型：符号链接 -> ${link_target:-未知}"
+      else
+        echo "   原类型：普通文件"
+      fi
+      echo
+    done < <(find "$RESOLV_BACKUP_DIR" -maxdepth 1 -type f -name 'resolv.conf.*' ! -name '*.meta' ! -name '*.link' 2>/dev/null | sort -r)
+  fi
+
+  if [[ "$n" -eq 0 ]]; then
+    echo "暂无备份。"
+  fi
+
+  echo "------------------------------------------------------------"
+}
+
+restore_resolv_conf_from_selected_backup() {
+  local -a backup_files=()
+  local -a link_files=()
+  local -a labels=()
+  local file choice i ns
+
+  if [[ -f "$RESOLV_BACKUP" ]]; then
+    backup_files+=("$RESOLV_BACKUP")
+    link_files+=("$RESOLV_LINK_BACKUP")
+    labels+=("默认备份")
+  fi
+
+  if [[ -d "$RESOLV_BACKUP_DIR" ]]; then
+    while IFS= read -r file; do
+      [[ -f "$file" ]] || continue
+      backup_files+=("$file")
+      link_files+=("${file}.link")
+      labels+=("历史备份：$(basename "$file")")
+    done < <(find "$RESOLV_BACKUP_DIR" -maxdepth 1 -type f -name 'resolv.conf.*' ! -name '*.meta' ! -name '*.link' 2>/dev/null | sort -r)
+  fi
+
+  if (( ${#backup_files[@]} == 0 )); then
+    warn "没有找到任何系统 DNS 备份。"
+    return 1
+  fi
+
+  echo
+  echo "请选择要恢复的备份："
+  echo "------------------------------------------------------------"
+  for i in "${!backup_files[@]}"; do
+    ns="$(get_backup_first_nameserver "${backup_files[$i]}")"
+    echo "$((i + 1)). ${labels[$i]}"
+    echo "   文件：${backup_files[$i]}"
+    echo "   首个 nameserver：${ns:-未知}"
+    if [[ -f "${link_files[$i]}" ]]; then
+      echo "   原类型：符号链接 -> $(cat "${link_files[$i]}" 2>/dev/null || true)"
+    else
+      echo "   原类型：普通文件 / 未记录"
+    fi
+  done
+  echo "0. 取消"
+  echo "------------------------------------------------------------"
+
+  read -rp "请输入选项: " choice
+  if [[ -z "$choice" || "$choice" == "0" ]]; then
+    warn "已取消恢复。"
+    return 0
+  fi
+
+  if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#backup_files[@]} )); then
+    err "无效选项"
+    return 1
+  fi
+
+  echo
+  warn "即将恢复：${labels[$((choice - 1))]}"
+  warn "当前 $RESOLV_CONF 会被覆盖。"
+  read -rp "确认恢复？[y/N]: " confirm
+  confirm="${confirm:-N}"
+  if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+    warn "已取消恢复。"
+    return 0
+  fi
+
+  restore_resolv_conf_backup_pair "${backup_files[$((choice - 1))]}" "${link_files[$((choice - 1))]}"
+}
+
+manage_system_dns_backup_menu() {
+  require_root
+
+  while true; do
+    clear
+    echo "============================================================"
+    echo " 系统 DNS 备份 / 恢复管理"
+    echo "============================================================"
+    show_current_resolv_conf_info
+    show_resolv_backup_status
+    echo
+    echo "1. 创建新的系统 DNS 备份"
+    echo "2. 查看所有系统 DNS 备份"
+    echo "3. 恢复默认系统 DNS 备份"
+    echo "4. 选择历史备份恢复"
+    echo "5. 写入临时公共 DNS（1.1.1.1 / 8.8.8.8）"
+    echo "0. 返回主菜单"
+    echo
+
+    read -rp "请输入选项: " choice
+
+    case "$choice" in
+      1)
+        create_resolv_conf_backup "manual"
+        pause
+        ;;
+      2)
+        list_resolv_conf_backups
+        pause
+        ;;
+      3)
+        if [[ -f "$RESOLV_BACKUP" ]]; then
+          warn "即将恢复默认备份：$RESOLV_BACKUP"
+          read -rp "确认恢复？[y/N]: " confirm
+          confirm="${confirm:-N}"
+          if [[ "$confirm" =~ ^[Yy]$ ]]; then
+            restore_resolv_conf_from_backup
+          else
+            warn "已取消恢复。"
+          fi
+        else
+          warn "没有找到默认备份：$RESOLV_BACKUP"
+        fi
+        pause
+        ;;
+      4)
+        restore_resolv_conf_from_selected_backup
+        pause
+        ;;
+      5)
+        warn "这会把系统 DNS 临时写为 1.1.1.1 / 8.8.8.8。"
+        read -rp "确认写入？[y/N]: " confirm
+        confirm="${confirm:-N}"
+        if [[ "$confirm" =~ ^[Yy]$ ]]; then
+          write_fallback_resolv_conf
+        else
+          warn "已取消。"
+        fi
+        pause
+        ;;
+      0)
+        return 0
+        ;;
+      *)
+        warn "无效选项"
+        pause
+        ;;
+    esac
+  done
+}
+
+restore_system_dns() {
+  require_root
+
+  if command -v chattr >/dev/null 2>&1; then
+    chattr -i "$RESOLV_CONF" 2>/dev/null || true
+  fi
+
+  if restore_resolv_conf_from_backup; then
+    :
+  else
+    warn "没有找到备份：$RESOLV_BACKUP"
+    warn "将写入一个临时公共 DNS 配置。"
+    write_fallback_resolv_conf
+  fi
+
+  pause
+}
+
 apply_rules_and_enable_system_dns() {
   require_root
 
@@ -1881,7 +2558,11 @@ apply_rules_and_enable_system_dns() {
     return 1
   fi
 
-  handle_port_conflict || true
+  if ! handle_port_conflict; then
+    warn "已取消一键应用。"
+    pause
+    return 1
+  fi
   systemctl daemon-reload
   systemctl enable dnsproxy
   systemctl restart dnsproxy
@@ -1910,18 +2591,12 @@ apply_system_dns_auto() {
     chattr -i "$RESOLV_CONF" 2>/dev/null || true
   fi
 
-  if [[ ! -f "$RESOLV_BACKUP" && -e "$RESOLV_CONF" ]]; then
-    cp -aL "$RESOLV_CONF" "$RESOLV_BACKUP" || true
-    ok "已备份：$RESOLV_BACKUP"
+  backup_resolv_conf_once
+
+  if ! write_dnsproxy_resolv_conf "auto"; then
+    warn "未修改 /etc/resolv.conf。"
+    return 1
   fi
-
-  rm -f "$RESOLV_CONF"
-  cat > "$RESOLV_CONF" << EOF
-nameserver ${LISTEN_ADDR}
-options edns0 trust-ad
-EOF
-
-  ok "已应用系统 DNS 到 ${LISTEN_ADDR}"
   ask_lock_resolv_conf || true
   return 0
 }
@@ -1966,22 +2641,13 @@ apply_system_dns() {
     chattr -i "$RESOLV_CONF" 2>/dev/null || true
   fi
 
-  if [[ ! -f "$RESOLV_BACKUP" ]]; then
-    if [[ -e "$RESOLV_CONF" ]]; then
-      cp -aL "$RESOLV_CONF" "$RESOLV_BACKUP" || true
-      ok "已备份：$RESOLV_BACKUP"
-    fi
-  else
-    warn "备份已存在：$RESOLV_BACKUP"
+  backup_resolv_conf_once
+
+  if ! write_dnsproxy_resolv_conf "manual"; then
+    warn "未修改 /etc/resolv.conf。"
+    pause
+    return 1
   fi
-
-  rm -f "$RESOLV_CONF"
-  cat > "$RESOLV_CONF" << EOF
-nameserver ${LISTEN_ADDR}
-options edns0 trust-ad
-EOF
-
-  ok "已写入 $RESOLV_CONF"
 
   ask_lock_resolv_conf || true
 
@@ -1995,17 +2661,12 @@ restore_system_dns() {
     chattr -i "$RESOLV_CONF" 2>/dev/null || true
   fi
 
-  if [[ -f "$RESOLV_BACKUP" ]]; then
-    rm -f "$RESOLV_CONF"
-    cp -a "$RESOLV_BACKUP" "$RESOLV_CONF"
-    ok "已恢复备份：$RESOLV_BACKUP -> $RESOLV_CONF"
+  if restore_resolv_conf_from_backup; then
+    :
   else
     warn "没有找到备份：$RESOLV_BACKUP"
     warn "将写入一个临时公共 DNS 配置。"
-    cat > "$RESOLV_CONF" << 'EOF'
-nameserver 1.1.1.1
-nameserver 8.8.8.8
-EOF
+    write_fallback_resolv_conf
   fi
 
   pause
@@ -2099,6 +2760,11 @@ show_status() {
   echo "- 系统是否使用 dnsproxy 解析：$(get_system_dnsproxy_usage_status)"
   echo "- 当前系统 DNS：$(get_system_dns_status)"
   echo "- resolv.conf 锁定状态：$(get_resolv_conf_lock_status)"
+  if [[ -f "$RESOLV_BACKUP" ]]; then
+    echo "- 系统 DNS 默认备份：存在"
+  else
+    echo "- 系统 DNS 默认备份：不存在"
+  fi
   echo "- DNS 解析模式：$(get_dns_resolution_mode)"
   echo
 
@@ -2218,7 +2884,11 @@ preview_ignored_rules() {
 
 start_dnsproxy() {
   require_root
-  handle_port_conflict || true
+  if ! handle_port_conflict; then
+    warn "已取消启动 / 重启 dnsproxy。"
+    pause
+    return 1
+  fi
   systemctl daemon-reload
   systemctl enable dnsproxy
   systemctl restart dnsproxy
@@ -2289,12 +2959,18 @@ uninstall_dnsproxy() {
   restore="${restore:-Y}"
 
   if [[ "$restore" =~ ^[Yy]$ ]]; then
-    if [[ -f "$RESOLV_BACKUP" ]]; then
-      rm -f "$RESOLV_CONF"
-      cp -a "$RESOLV_BACKUP" "$RESOLV_CONF"
+    if restore_resolv_conf_from_backup; then
       ok "已恢复 /etc/resolv.conf"
     else
-      warn "没有找到备份，跳过恢复。"
+      warn "没有找到备份，将写入临时公共 DNS，避免卸载后系统无法解析域名。"
+      write_fallback_resolv_conf
+    fi
+  else
+    local current_ns
+    current_ns="$(get_system_dns_status)"
+    if [[ "$current_ns" == "127.0.0.1" || "$current_ns" == "::1" ]]; then
+      warn "当前系统 DNS 仍指向本机。dnsproxy 卸载后本机 DNS 会失效，将写入临时公共 DNS。"
+      write_fallback_resolv_conf
     fi
   fi
 
@@ -2422,7 +3098,7 @@ main_menu() {
     menu_cyan_fixed_right "╠══ 服务控制 ══════════════════════════════════════════" "╣"
     menu_cyan_line 0 "  ${GREEN} 5)${NC} 启动 / 重启 dnsproxy"
     menu_cyan_line 0 "  ${GREEN} 6)${NC} 停止 dnsproxy"
-    menu_cyan_line 0 "  ${GREEN} 7)${NC} 恢复系统 DNS 备份"
+    menu_cyan_line 0 "  ${GREEN} 7)${NC} 系统 DNS 备份 / 恢复管理"
     menu_cyan_fixed_right "╠══ 查看与调试 ════════════════════════════════════════" "╣"
     menu_cyan_line 0 "  ${GREEN} 8)${NC} 测试域名解析"
     menu_cyan_line 0 "  ${GREEN} 9)${NC} 查看状态"
@@ -2461,7 +3137,7 @@ main_menu() {
         stop_dnsproxy
         ;;
       7)
-        restore_system_dns
+        manage_system_dns_backup_menu
         ;;
       8)
         test_dns
@@ -2505,8 +3181,10 @@ main_menu() {
 
 if [[ "${1:-}" == "--update-rules" ]]; then
   require_root
+  require_systemd
   update_online_rules
   exit 0
 fi
 
+require_systemd
 main_menu
